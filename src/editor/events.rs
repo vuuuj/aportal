@@ -35,6 +35,24 @@ fn apply_add_kind(st: &mut super::state::EditorState, k: AddKind) {
     }
 }
 
+/// Abort any in-progress mouse interaction (drag/box-select/resize).
+/// Phase switching must call this: leftover state from the old phase would act on the new
+/// one (e.g. a Selecting drag box kept alive after Enter leaves a ghost box when switching back).
+fn cancel_interactions(st: &mut super::state::EditorState) {
+    st.is_dragging = false;
+    st.drag_start = None;
+    st.drag_current = None;
+    st.drag_index = None;
+    st.resize_index = None;
+    st.resize_start = None;
+    st.resize_start_font = 0;
+    st.multi_dragging = false;
+    st.box_selecting = false;
+    st.box_select_start = None;
+    st.box_select_current = None;
+    st.undo_pending = None;
+}
+
 // ===== Mouse down =====
 
 pub fn on_lbutton_down(x: i32, y: i32) -> bool {
@@ -340,6 +358,13 @@ fn delete_selected(st: &mut super::state::EditorState) {
         }
     }
     st.selected_indices.clear();
+    // Deleting mid-drag/resize (mouse still captured): the interaction indices now dangle
+    // and the next WM_MOUSEMOVE would index out of bounds. Cancel the interaction, like do_undo.
+    st.drag_index = None;
+    st.resize_index = None;
+    st.resize_start = None;
+    st.multi_dragging = false;
+    st.undo_pending = None;
 }
 
 fn handle_toolbar_action(action: BtnAction) -> bool {
@@ -354,6 +379,7 @@ fn handle_toolbar_action(action: BtnAction) -> bool {
             }
             BtnAction::NextStep => {
                 if st.phase == EditorPhase::Selecting && !st.elements.is_empty() {
+                    cancel_interactions(st);
                     st.phase = EditorPhase::Arranging;
                     st.selected_indices.clear();
                 }
@@ -361,6 +387,7 @@ fn handle_toolbar_action(action: BtnAction) -> bool {
             }
             BtnAction::BackToSelect => {
                 if st.phase == EditorPhase::Arranging {
+                    cancel_interactions(st);
                     st.phase = EditorPhase::Selecting;
                     st.selected_indices.clear();
                 }
@@ -521,8 +548,11 @@ pub fn on_lbutton_up(x: i32, y: i32) {
                         let rw = (cx - sx).abs();
                         let rh = (cy - sy).abs();
                         if rw > 10 && rh > 10 {
-                            let rx = sx.min(cx);
-                            let ry = sy.min(cy);
+                            // Clamp to >=0: with SetCapture the mouse can drag past the primary
+                            // monitor's left/top edge onto a negative-coordinate monitor, and a
+                            // negative value here would wrap through `as u32` into a huge source coord
+                            let rx = sx.min(cx).max(0);
+                            let ry = sy.min(cy).max(0);
                             // Element stays where it was selected (screen coords → overlay-relative coords),
                             // so the arranging phase shows the real captured position instead of stacking them.
                             let dx = rx - st.overlay_x;
@@ -606,6 +636,8 @@ pub fn on_rbutton() -> bool {
                 if !st.elements.is_empty() {
                     push_undo(st);
                     st.elements.pop();
+                    // The popped element may be selected: indices would then exceed len
+                    st.selected_indices.clear();
                 }
                 false
             }
@@ -701,6 +733,18 @@ pub fn on_keydown(vk: u32) -> bool {
                 if st.selected_indices.is_empty() {
                     return false;
                 }
+                // Only push an undo layer when something can actually move: stale indices
+                // (deleted elements) or source-less UI elements selected in Selecting would
+                // otherwise create an empty "undo that changes nothing" step
+                let has_valid_target = st.selected_indices.iter().any(|&i| match st.phase {
+                    EditorPhase::Selecting => {
+                        st.elements.get(i).map(|e| e.source.is_some()).unwrap_or(false)
+                    }
+                    EditorPhase::Arranging => i < st.elements.len(),
+                });
+                if !has_valid_target {
+                    return false;
+                }
                 push_undo(st); // one undo step per arrow-key nudge
                 // Selecting phase: move the source rect; arranging phase: move the display rect
                 match st.phase {
@@ -735,6 +779,7 @@ pub fn on_keydown(vk: u32) -> bool {
                         st.saved = false;
                         true
                     } else {
+                        cancel_interactions(st);
                         st.phase = EditorPhase::Arranging;
                         st.selected_indices.clear();
                         false
@@ -816,6 +861,11 @@ pub fn on_mouse_wheel(x: i32, y: i32, delta: i32) -> bool {
         return false;
     }
     with_state(|st| {
+        // Modal: block wheel adjustments while the overwrite-confirm popup is open
+        // (consistent with on_mouse_move / on_keydown)
+        if st.confirm_overwrite {
+            return false;
+        }
         // Panel value row (snap distance / gap / nudge)
         if let Some(tk) = panel_toggle_wheel_hit(st, x, y) {
             let target = match tk {

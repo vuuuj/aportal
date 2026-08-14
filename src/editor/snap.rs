@@ -69,7 +69,9 @@ pub fn snap_arrangement(st: &mut EditorState, idx: usize, new_x: i32, new_y: i32
     }
 
     let snap_dist = st.snap_distance;
-    let (moving_w, moving_h) = (st.elements[idx].display.width, st.elements[idx].display.height);
+    // Effective size: auto-sized Png/Text elements carry display w/h 0, but snapping must
+    // use the real footprint (same as hit testing) or centers/edges are off by half the size
+    let (moving_w, moving_h) = super::arranging::eff_size(st, idx);
     let mut x_candidates: Vec<(i32, i32)> = Vec::new();
     let mut y_candidates: Vec<(i32, i32)> = Vec::new();
 
@@ -150,8 +152,6 @@ pub fn snap_arrangement(st: &mut EditorState, idx: usize, new_x: i32, new_y: i32
 
 /// Resize snapping
 pub fn snap_resize(elements: &[Element], idx: usize, new_w: i32, new_h: i32, snap_distance: i32) -> (i32, i32) {
-    let (mut snap_w, mut snap_h) = (new_w, new_h);
-
     if idx >= elements.len() {
         return (new_w, new_h);
     }
@@ -159,6 +159,11 @@ pub fn snap_resize(elements: &[Element], idx: usize, new_w: i32, new_h: i32, sna
     let moving = &elements[idx].display;
     let moving_r = moving.x + new_w;
     let moving_b = moving.y + new_h;
+
+    // Nearest candidate wins (same policy as snap_axis); the old loop let the LAST hit
+    // overwrite earlier nearer ones, snapping to a far edge in dense layouts
+    let mut best_w = (i32::MAX, new_w);
+    let mut best_h = (i32::MAX, new_h);
 
     for (i, o) in elements.iter().enumerate() {
         if i == idx {
@@ -170,13 +175,19 @@ pub fn snap_resize(elements: &[Element], idx: usize, new_w: i32, new_h: i32, sna
         let or = other.x + other.width;
         let ob = other.y + other.height;
 
-        if (moving_r - ox).abs() <= snap_distance { snap_w = ox - moving.x; }
-        if (moving_r - or).abs() <= snap_distance { snap_w = or - moving.x; }
-        if (moving_b - oy).abs() <= snap_distance { snap_h = oy - moving.y; }
-        if (moving_b - ob).abs() <= snap_distance { snap_h = ob - moving.y; }
+        for (d, w) in [((moving_r - ox).abs(), ox - moving.x), ((moving_r - or).abs(), or - moving.x)] {
+            if d <= snap_distance && d < best_w.0 {
+                best_w = (d, w);
+            }
+        }
+        for (d, h) in [((moving_b - oy).abs(), oy - moving.y), ((moving_b - ob).abs(), ob - moving.y)] {
+            if d <= snap_distance && d < best_h.0 {
+                best_h = (d, h);
+            }
+        }
     }
 
-    (snap_w.max(20), snap_h.max(20))
+    (best_w.1.max(20), best_h.1.max(20))
 }
 
 /// Draw snap guide lines
