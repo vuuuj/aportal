@@ -1,0 +1,87 @@
+# APortal UI translations (English)
+
+# tray menu
+new_config: New Config
+edit_existing: Edit Existing
+open_folder: Open Folder
+auto_switch: Auto Switch (Pad/Keyboard)
+reload_configs: Reload Configs
+unload_config: Unload Config
+load_config: Load
+quit: Quit
+refresh_rate: Refresh Rate
+pad: Pad
+keyboard: Keyboard
+
+# editor window
+editor_title: APortal Editor
+
+# element property labels
+opacity: Opacity
+z_order: Z-order
+rotate: Rotate
+border_color: Border
+border_width: Border W
+corner_radius: Radius
+bg_color: Fill
+content: Content
+font_size: Font
+text_color: Text Clr
+png_path: Image Path
+
+# element type badges
+badge_capture: C
+badge_frame: F
+badge_bg: B
+badge_png: I
+badge_text: T
+
+# panel
+region_list: Regions
+count_suffix: " items"
+drag_hint: ≡ Drag
+filename_label: Filename
+filename_hint: Empty uses Untitled.yml
+unnamed_file: Untitled.yml
+elem_props: Element Props
+add_frame: +Frame
+add_bg: +Fill
+add_png: +Image
+add_text: +Text
+
+# editor buttons
+undo_last: Undo Last Step
+select_mode: Select
+arrange_mode: Arrange
+cancel: Cancel
+delete_selected: Delete
+save: Save
+discard: Discard
+
+# toggle / value rows
+toggle_magnifier: Magnify
+toggle_grid: Grid
+toggle_crosshair: Crosshair
+toggle_xy: XY
+toggle_snap: Snap
+toggle_tian: 田
+snap_dist: "Snap dist:"
+snap_gap: "Gap:"
+nudge_step: "Nudge:"
+
+# bottom hint bar
+hint_selecting: Drag to select area   ·   Arrow keys to nudge   ·   Right-click undo   ·   Enter to arrange   ·   Esc to cancel
+hint_arranging: Drag to move   ·   Corner to resize   ·   Select mode   ·   Arrows to nudge   ·   Ctrl+click multi-select   ·   Del delete   ·   Right-click/Ctrl+Z undo   ·   Enter save   ·   Esc discard
+
+# overwrite confirm modal
+cfg_exists: Config already exists
+overwrite_ask: already exists. Overwrite?
+yes_overwrite: Yes, overwrite
+no: No
+
+# misc
+no_image: (no image)
+
+# tray input group
+unset: (none)
+n_more_groups: "{}... ({} total)"

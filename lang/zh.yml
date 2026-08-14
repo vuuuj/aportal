@@ -1,0 +1,88 @@
+# APortal UI translations (Chinese)
+# Keys are English identifiers; values are display texts.
+
+# tray menu
+new_config: 新建配置文件
+edit_existing: 编辑已有配置
+open_folder: 打开程序目录
+auto_switch: 手柄键鼠自动切换
+reload_configs: 刷新配置
+unload_config: 卸载配置
+load_config: 加载
+quit: 退出
+refresh_rate: 刷新率
+pad: 手柄
+keyboard: 键鼠
+
+# editor window
+editor_title: APortal 编辑器
+
+# element property labels
+opacity: 透明度
+z_order: 层级
+rotate: 旋转
+border_color: 描边色
+border_width: 描边宽
+corner_radius: 圆角
+bg_color: 填充色
+content: 内容
+font_size: 字号
+text_color: 文字色
+png_path: 图片路径
+
+# element type badges
+badge_capture: 捕
+badge_frame: 框
+badge_bg: 底
+badge_png: 图
+badge_text: 字
+
+# panel
+region_list: 区域列表
+count_suffix: 个
+drag_hint: ≡ 拖动
+filename_label: 保存文件名
+filename_hint: 留空则用 未命名.yml
+unnamed_file: 未命名.yml
+elem_props: 元素属性
+add_frame: +框
+add_bg: +底
+add_png: +图
+add_text: +字
+
+# editor buttons
+undo_last: 撤销上一步
+select_mode: 选取
+arrange_mode: 排布
+cancel: 取消
+delete_selected: 删除选中
+save: 保存
+discard: 放弃
+
+# toggle / value rows
+toggle_magnifier: 放大镜
+toggle_grid: 网格
+toggle_crosshair: 十字线
+toggle_xy: XY值
+toggle_snap: 吸附
+toggle_tian: 田字
+snap_dist: "吸附距离:"
+snap_gap: "间隔:"
+nudge_step: "微调:"
+
+# bottom hint bar
+hint_selecting: 拖拽框选屏幕区域   ·   方向键微调选中   ·   右键撤销   ·   Enter 进入排布   ·   Esc 取消
+hint_arranging: 拖拽移动   ·   右下角缩放   ·   进入选区模式   ·   方向键微调(步长可设)   ·   Ctrl+点击多选   ·   Del 删除   ·   右键/Ctrl+Z 撤销   ·   Enter 保存   ·   Esc 放弃
+
+# overwrite confirm modal
+cfg_exists: 配置文件已存在
+overwrite_ask: 已存在，是否覆盖？
+yes_overwrite: 是，覆盖
+no: 否
+
+# misc
+no_image: 未设置图片
+
+# tray input group
+unset: 未设置
+n_more_groups: "{}...等{}组"

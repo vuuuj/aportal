@@ -1,0 +1,46 @@
+﻿[package]
+name = "aportal"
+version = "0.1.0"
+edition = "2021"
+description = "APortal - 屏幕区域重组显示工具"
+
+# 产物文件名: APortal.exe (大写)
+[[bin]]
+name = "APortal"
+path = "src/main.rs"
+
+# release 优化:体积小、性能高
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# 用 unwind 以便 panic 时能写崩溃日志 (定位闪退后可改回 abort)
+panic = "unwind"
+
+[dependencies]
+# Windows API 绑定 - 最小原型只需 DXGI + D3D11 + GDI(UpdateLayeredWindow) + 窗口
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+] }
+
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0.12"
+png = "0.17"
+
+[build-dependencies]
+embed-resource = "2"

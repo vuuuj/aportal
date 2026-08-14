@@ -1,0 +1,13 @@
+# APortal 全局设置模板: 首次运行自动生成, 可手动修改
+fps: 60
+enabled_configs: []
+snap_distance: 8
+snap_gap: 6
+nudge_step: 1
+input_auto_switch: false
+input_track_mouse: true
+input_poll_interval_ms: 200
+keyboard_configs: []
+controller_configs: []
+lang: zh
+log_enabled: false

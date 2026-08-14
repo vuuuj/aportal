@@ -1,0 +1,31 @@
+# 示例配置: 把屏幕左上角的 4 个方块区域搬到右下角, 并叠加 4 张按钮图标
+# 用法: 复制为任意名字的 .yml 放到 APortal.exe 同目录, 托盘菜单启用它
+# 亮点: 全局 opacity 0.55; A.png 旋转 90 度; Y.png 单独透明度 0.9 (覆盖全局)
+settings:
+  global_opacity: 0.55
+capture_regions:
+- id: skill_1
+  source: {x: 100, 'y': 100, w: 60, h: 60}
+  display: {x: 200, 'y': 800, z: 1}
+- id: skill_2
+  source: {x: 170, 'y': 100, w: 60, h: 60}
+  display: {x: 270, 'y': 800, z: 2}
+- id: skill_3
+  source: {x: 240, 'y': 100, w: 60, h: 60}
+  display: {x: 340, 'y': 800, z: 6}
+- id: skill_4
+  source: {x: 310, 'y': 100, w: 60, h: 60}
+  display: {x: 410, 'y': 800}
+custom_ui:
+- type: image
+  path: X.png
+  geometry: {x: 220, 'y': 740, z: 10}
+- type: image
+  path: A.png
+  geometry: {x: 290, 'y': 790, z: 10, rotate: 90}
+- type: image
+  path: Y.png
+  geometry: {x: 290, 'y': 700, z: 10, opacity: 0.9}
+- type: image
+  path: B.png
+  geometry: {x: 360, 'y': 740, z: 10}
