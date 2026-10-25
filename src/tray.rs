@@ -147,7 +147,6 @@ pub fn poll_command() -> Option<TrayCommand> {
 /// Tray controller. The icon is removed automatically on drop.
 pub struct TrayIcon {
     hwnd: HWND,
-    #[allow(dead_code)]
     menu: HMENU,
 }
 
@@ -297,6 +296,12 @@ fn text_utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Dynamic text for a Win32 menu: a single `&` marks an accelerator and is not
+/// displayed, so config file names containing `&` must double it.
+fn menu_text_utf16(s: &str) -> Vec<u16> {
+    text_utf16(&s.replace('&', "&&"))
+}
+
 unsafe fn build_menu_inner(menu: HMENU, current_fps: u32) -> AppResult<HMENU> {
     // refresh rate submenu (title shows the current fps)
         let fps_submenu = CreatePopupMenu()
@@ -324,8 +329,7 @@ unsafe fn build_menu_inner(menu: HMENU, current_fps: u32) -> AppResult<HMENU> {
             let edit_submenu = CreatePopupMenu()
                 .map_err(|e| AppError::windows("CreatePopupMenu edit_submenu", e))?;
             for (i, name) in config_files.iter().enumerate() {
-                let mut label: Vec<u16> = name.encode_utf16().collect();
-                label.push(0);
+                let label = menu_text_utf16(name);
                 let pcstr = windows::core::PCWSTR::from_raw(label.as_ptr());
                 // check configs in use (MF_CHECKED)
                 let flags = if active.contains(name) { 0x8u32 } else { 0u32 };
@@ -345,8 +349,7 @@ unsafe fn build_menu_inner(menu: HMENU, current_fps: u32) -> AppResult<HMENU> {
             let auto_on = auto_switch_shared();
             let manual = manual_enabled_shared();
             for (i, name) in config_files.iter().enumerate() {
-                let mut label: Vec<u16> = name.encode_utf16().collect();
-                label.push(0);
+                let label = menu_text_utf16(name);
                 let pcstr = windows::core::PCWSTR::from_raw(label.as_ptr());
                 let mut flags = 0u32;
                 if manual.iter().any(|f| f == name) { flags |= 0x8u32; } // MF_CHECKED
@@ -394,7 +397,7 @@ unsafe fn build_menu_inner(menu: HMENU, current_fps: u32) -> AppResult<HMENU> {
             } else {
                 (t("unload_config").to_string(), 0x1) // MF_GRAYED
             };
-        let unload_label = text_utf16(&unload_label);
+        let unload_label = menu_text_utf16(&unload_label);
         AppendMenuW(menu, MENU_ITEM_FLAGS(unload_flags), MENU_UNLOAD_CONFIG, PCWSTR::from_raw(unload_label.as_ptr()))?;
 
         // separator + quit
@@ -428,8 +431,7 @@ unsafe fn append_input_group_menu(
     let submenu = CreatePopupMenu()
         .map_err(|e| AppError::windows("CreatePopupMenu input_group_submenu", e))?;
     for (i, name) in config_files.iter().enumerate() {
-        let mut label: Vec<u16> = name.encode_utf16().collect();
-        label.push(0);
+        let label = menu_text_utf16(name);
         let pcstr = windows::core::PCWSTR::from_raw(label.as_ptr());
         let flags = if members.contains(name) { 0x8u32 } else { 0u32 }; // MF_CHECKED
         let _ = AppendMenuW(submenu, MENU_ITEM_FLAGS(flags), id_base + i, pcstr);
@@ -440,12 +442,10 @@ unsafe fn append_input_group_menu(
         members.join(", ")
     } else {
         t("n_more_groups")
-            .replace("{}", &members[..3].join(", "))
-            .replace("{}", &members.len().to_string())
+            .replacen("{}", &members[..3].join(", "), 1)
+            .replacen("{}", &members.len().to_string(), 1)
     };
-    let title = format!("{side_name}: {suffix}\0");
-    let mut title_utf16: Vec<u16> = title.encode_utf16().collect();
-    title_utf16.push(0);
+    let title_utf16 = menu_text_utf16(&format!("{side_name}: {suffix}"));
     let pcstr = windows::core::PCWSTR::from_raw(title_utf16.as_ptr());
     // MF_POPUP(0x10) + (auto_on ? 0 : MF_GRAYED)
     let flags = if auto_on { 0x10u32 } else { 0x11u32 };
@@ -623,5 +623,29 @@ unsafe fn show_menu_inline(hwnd: HWND) {
             let _ = DestroyMenu(menu);
         }
         Err(e) => log::error!("failed to build menu: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::menu_text_utf16;
+
+    fn decode(utf16: &[u16]) -> String {
+        assert_eq!(utf16.last(), Some(&0), "menu text must be NUL-terminated");
+        String::from_utf16(&utf16[..utf16.len() - 1]).unwrap()
+    }
+
+    #[test]
+    fn menu_text_doubles_ampersands() {
+        // A single '&' in a Win32 menu marks an accelerator and is hidden,
+        // so literal ampersands in config names must be doubled.
+        assert_eq!(decode(&menu_text_utf16("A&B.yml")), "A&&B.yml");
+        assert_eq!(decode(&menu_text_utf16("&&")), "&&&&");
+    }
+
+    #[test]
+    fn menu_text_keeps_plain_and_unicode_names_intact() {
+        assert_eq!(decode(&menu_text_utf16("normal.yml")), "normal.yml");
+        assert_eq!(decode(&menu_text_utf16("配置 1.yml")), "配置 1.yml");
     }
 }

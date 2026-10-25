@@ -35,8 +35,17 @@ pub struct RenderedUi {
 
 /// Called at startup: pre-renders all custom_ui elements into pixel buffers, sorted by z_order
 /// global_opacity: effective global opacity when an element has no explicit opacity
-pub fn prerender_ui(elements: &[CustomUiElement], exe_dir: &Path, global_opacity: f32) -> Vec<RenderedUi> {
+///
+/// Returns the rendered elements plus one message per element that failed to
+/// render. Failures must reach the user: with logging disabled (the default),
+/// an image that silently disappears is impossible to diagnose.
+pub fn prerender_ui(
+    elements: &[CustomUiElement],
+    exe_dir: &Path,
+    global_opacity: f32,
+) -> (Vec<RenderedUi>, Vec<String>) {
     let mut rendered: Vec<RenderedUi> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
     for (i, elem) in elements.iter().enumerate() {
         log::info!("pre-render UI element #{}: {:?}", i, elem);
@@ -54,13 +63,16 @@ pub fn prerender_ui(elements: &[CustomUiElement], exe_dir: &Path, global_opacity
                 log::info!("  -> OK {}x{} @({},{})", ui.w, ui.h, ui.x, ui.y);
                 rendered.push(ui);
             }
-            Err(e) => log::error!("  -> pre-render failed: {}", e),
+            Err(e) => {
+                log::error!("  -> pre-render failed: {}", e);
+                errors.push(format!("#{}: {}", i + 1, e));
+            }
         }
         log::logger().flush();
     }
 
     rendered.sort_by_key(|r| r.z_order);
-    rendered
+    (rendered, errors)
 }
 
 /// Rotate a premultiplied BGRA pixel buffer by `deg` degrees clockwise around its center.

@@ -71,6 +71,16 @@ pub fn load_from_file(path: &std::path::Path) {
     }
 }
 
+/// Load the language file next to the running exe (`lang\<lang>.yml`).
+/// Must be called after `set_lang()`; a missing/broken file degrades to English keys.
+pub fn load_for_exe() {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(dir) = exe_path.parent() {
+            load_from_file(&dir.join("lang").join(lang_file_name(lang())));
+        }
+    }
+}
+
 /// Translate a UI key (English key in code) using the loaded language table.
 /// Missing keys return the key itself (English), so a missing lang file degrades to English.
 pub fn t(key: &'static str) -> &'static str {

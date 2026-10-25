@@ -79,6 +79,28 @@ overwrite_ask: already exists. Overwrite?
 yes_overwrite: Yes, overwrite
 no: No
 
+# error dialogs
+load_failed: Cannot Load Config
+save_failed: Save Failed
+startup_failed: Startup Failed
+already_running: APortal Is Already Running
+already_running_hint: "APortal is already running in this session.\n\nLook for the APortal icon in the notification area (system tray)."
+settings_load_failed: Cannot Read Settings
+settings_backup_hint: "Default settings are in use. The original file was preserved as:\n{}\n\nError: {}"
+settings_no_write_hint: "Default settings are in use, but the original file could not be preserved. Settings will not be written back.\n\nError: {}"
+config_activate_failed: Cannot Load Config
+config_activate_hint: "These configs could not be loaded:"
+ui_render_failed: UI Element Failed
+capture_failed: Screen Capture Problem
+capture_retry_hint: "Screen capture keeps failing; the program will keep retrying."
+capture_rebuild_hint: "The desktop capture session was lost and cannot be recreated right now (often caused by an exclusive-fullscreen game).\nThe program will keep retrying and usually recovers after switching back to windowed mode; the overlay will not update in the meantime."
+present_failed: Overlay Update Problem
+present_retry_hint: "The overlay for {} keeps failing to update; the program will keep retrying."
+resolution_changed: Display Resolution Changed
+resolution_changed_hint: "The desktop resolution changed from {old} to {new}.\n\nThese configs have capture regions outside the new screen; those parts will render black:\n{list}\n\nEdit these configs and adjust their capture regions."
+empty_config_title: Empty Config
+empty_config_ask: "This config has no regions or UI elements.\nSave an empty config anyway?"
+
 # misc
 no_image: (no image)
 

@@ -17,12 +17,14 @@
 mod capture;
 mod config;
 mod custom_ui;
+mod dialog;
 mod editor;
 mod error;
 mod i18n;
 mod input;
 mod log_init;
 mod overlay;
+mod single_instance;
 mod tray;
 
 use std::path::PathBuf;
@@ -30,16 +32,41 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use std::hint::spin_loop;
 
+use windows::Win32::Foundation::HWND;
+
 use capture::{DxgiCapture, RegionFrame, RegionRect};
 use config::{Config, GlobalSettings};
 use custom_ui::{composite_ui, prerender_ui, RenderedUi};
-use error::AppResult;
+use error::{AppError, AppResult};
 use input::{Input, InputMode};
 use overlay::OverlayWindow;
+use single_instance::InstanceGuard;
 use tray::{poll_command, set_active_configs, set_auto_enable, set_current_fps, set_manual_enabled_configs, TrayCommand, TrayIcon};
 
 /// Current target frame rate (variable, switched via tray menu). Atomic so the main loop reads and tray commands write.
 static TARGET_FPS: AtomicU32 = AtomicU32::new(30);
+
+/// After this many consecutive capture errors, back off instead of calling the
+/// capture API every frame. The program keeps running and retries; a persistent
+/// failure is reported to the user once per error streak.
+const MAX_CONSECUTIVE_ERRORS: u32 = 30;
+
+/// Persistent DDA rebuild failures (each retry already waits ~1.2s) before telling
+/// the user the duplication session cannot be restored right now.
+const DDA_REBUILD_NOTICE_AFTER: u32 = 5;
+
+/// A runtime failure must persist this long before a modal box appears, so a
+/// transient display-mode switch does not interrupt the user.
+const RUNTIME_ERROR_NOTICE_AFTER: Duration = Duration::from_secs(2);
+
+/// Activation failures already shown in this session (filename + error text).
+/// Avoids a popup every time an auto-switch group retries a broken config.
+static REPORTED_ACTIVATION_ERRORS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// UI pre-render failures already shown (filename + element error).
+static REPORTED_UI_ERRORS: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
 
 /// One active config instance: config + its overlay window + pre-rendered UI
 struct ActiveConfig {
@@ -50,6 +77,14 @@ struct ActiveConfig {
     /// Overlay window size (auto-derived from the content bounding box)
     ow: i32,
     oh: i32,
+    /// True until the static (capture-region-free) content has been presented once.
+    /// A UI-only config has no capture frames to drive the render path, so it must
+    /// be presented explicitly by the main loop.
+    needs_static_present: bool,
+    /// Start of the current continuous present-failure streak (None = healthy)
+    present_fail_since: Option<Instant>,
+    /// Whether this streak has already produced a user-visible warning
+    present_fail_reported: bool,
 }
 
 /// Frame counters printed by the periodic stats
@@ -105,7 +140,18 @@ impl FrameStats {
     }
 }
 
-fn main() -> AppResult<()> {
+fn main() {
+    if let Err(e) = run() {
+        log::error!("Fatal error: {}", e);
+        dialog::error(
+            HWND(std::ptr::null_mut()),
+            i18n::t("startup_failed"),
+            &e.to_string(),
+        );
+    }
+}
+
+fn run() -> AppResult<()> {
     // 0. DPI 感知声明必须先于任何窗口/捕获创建: 否则 DDA 返回缩放后的虚拟分辨率
     // (如 3440x1440@175% -> 1966x823), 源区域越界导致黑框
     let dpi_v2_ok = unsafe {
@@ -123,9 +169,35 @@ fn main() -> AppResult<()> {
         }
     }
 
+    // 0.1 Single instance: acquire before touching settings/log/capture. A second
+    // copy would stack overlays and overwrite settings.yml on exit. On a duplicate
+    // start, read only the language preference (side-effect-free) for the dialog.
+    let _instance = match InstanceGuard::acquire() {
+        Some(guard) => guard,
+        None => {
+            i18n::set_lang(&GlobalSettings::load().lang);
+            i18n::load_for_exe();
+            log::warn!("Another APortal instance is already running; exiting");
+            dialog::info(
+                HWND(std::ptr::null_mut()),
+                i18n::t("already_running"),
+                i18n::t("already_running_hint"),
+            );
+            return Ok(());
+        }
+    };
+
     // 0. Global settings (settings.yml: FPS memory + config toggles) — loaded BEFORE log init
-    // because the log_enabled switch decides whether any log file is written at all
-    let mut global = GlobalSettings::load();
+    // because the log_enabled switch decides whether any log file is written at all.
+    // A broken file is preserved and reported instead of silently reset to defaults.
+    let settings_load = GlobalSettings::load_with_status();
+    let settings_writable = settings_load.can_write();
+    let config::SettingsLoad {
+        settings,
+        error: settings_error,
+        backup: settings_backup,
+    } = settings_load;
+    let mut global = settings;
     log_init::init(global.log_enabled);
     log::info!("=== APortal v{} started ===", env!("CARGO_PKG_VERSION"));
     log::info!(
@@ -141,10 +213,22 @@ fn main() -> AppResult<()> {
     i18n::set_lang(&global.lang);
     log::info!("UI language: {:?}", i18n::lang());
     // 0.4.1 Load language file (lang\<lang>.yml next to the exe; t() falls back to the English key when missing)
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            i18n::load_from_file(&dir.join("lang").join(i18n::lang_file_name(i18n::lang())));
-        }
+    i18n::load_for_exe();
+
+    // 0.4.2 Report a broken settings.yml now that the language file and log are ready.
+    if let Some(err) = settings_error {
+        let text = match settings_backup {
+            Some(path) => i18n::t("settings_backup_hint")
+                .replacen("{}", &path.display().to_string(), 1)
+                .replacen("{}", &err, 1),
+            None => i18n::t("settings_no_write_hint").replace("{}", &err),
+        };
+        log::error!("Settings file problem: {}", err);
+        dialog::error(
+            HWND(std::ptr::null_mut()),
+            i18n::t("settings_load_failed"),
+            &text,
+        );
     }
 
     // 0.5 Prune settings references to deleted/legacy .yaml configs (prevent stale memory).
@@ -156,10 +240,13 @@ fn main() -> AppResult<()> {
     // 1. Capturer
     let mut cap = DxgiCapture::new()?;
     log::info!("Desktop resolution: {}x{}", cap.width, cap.height);
+    let mut screen_w = cap.width;
+    let mut screen_h = cap.height;
 
     // Enable only configs turned on in settings.yml; also runs fine with none (empty overlay)
     let mut actives: Vec<ActiveConfig> = Vec::new();
     let all_configs = config::scan_config_files();
+    let mut activation_errors: Vec<(String, String)> = Vec::new();
     for filename in &all_configs {
         if global.is_enabled(filename) {
             match activate_config(filename) {
@@ -167,12 +254,34 @@ fn main() -> AppResult<()> {
                     log::info!("Config activated: {}", filename);
                     actives.push(ac);
                 }
-                Err(e) => log::error!("Failed to activate config {}: {}", filename, e),
+                Err(e) => {
+                    log::error!("Failed to activate config {}: {}", filename, e);
+                    activation_errors.push((filename.clone(), e.to_string()));
+                }
             }
         }
     }
     sync_tray_active_list(&actives);
     log::info!("Active configs: {}", actives.len());
+    if !activation_errors.is_empty() {
+        // One dialog for all startup failures instead of one modal per config.
+        let details: Vec<String> = activation_errors
+            .iter()
+            .map(|(name, err)| format!("{}: {}", name, err))
+            .collect();
+        for (name, err) in &activation_errors {
+            mark_activation_error(name, err);
+        }
+        dialog::error(
+            HWND(std::ptr::null_mut()),
+            i18n::t("config_activate_failed"),
+            &format!(
+                "{}\n\n{}",
+                i18n::t("config_activate_hint"),
+                details.join("\n")
+            ),
+        );
+    }
 
     // 2.5 Push the manual config set so the tray menu check marks match in-memory truth
     // (settings.yml is written once on exit, so the tray must not trust the disk copy)
@@ -201,6 +310,10 @@ fn main() -> AppResult<()> {
     let mut current_fps = initial_fps;
     let mut frame_duration = fps_to_duration(current_fps);
     let mut consecutive_errors: u32 = 0;
+    let mut capture_error_since: Option<Instant> = None;
+    let mut capture_error_reported = false;
+    // DDA session rebuild failures (ACCESS_LOST) already surfaced to the user
+    let mut dda_rebuild_reported = false;
     // DWM present-timestamp tracking (source frame interval diagnostic)
     let mut qpc_freq_raw: i64 = 0;
     unsafe {
@@ -210,7 +323,6 @@ fn main() -> AppResult<()> {
     }
     let qpc_freq = qpc_freq_raw.max(1) as f64;
     let mut last_present_tick_prev: Option<i64> = None;
-    const MAX_CONSECUTIVE_ERRORS: u32 = 30;
     // Periodic settings flush timer (settings.yml is normally written once on exit; this is a
     // safety net so an abnormal termination loses at most SETTINGS_FLUSH_INTERVAL of changes)
     let mut last_settings_save = Instant::now();
@@ -243,59 +355,72 @@ fn main() -> AppResult<()> {
                     log::info!("Creating a new config file");
                     let base_cfg = Config::default();
                     match editor::run_editor(&base_cfg, "") {
-                        Ok(Some((new_cfg, filename))) => {
-                            if let Err(e) = new_cfg.save_as(&filename) {
-                                log::error!("Failed to save config: {}", e);
-                            }
-                            // New config auto-enabled (single-select: the only slot goes to the new config, auto-switch yields)
-                            select_single_config(&mut global, &filename);
-                            sync_input_groups_to_tray(&global);
-                            // Drop other config windows, then reload this config (= automatic "reload config")
-                            apply_input_mode(&mut actives, &global, input_detect.mode());
-                            reload_or_activate(&mut actives, &filename);
-                            log::info!("Edit done, config: {}", filename);
+                        // run_editor writes the file itself and returns only after a
+                        // successful save; a write error keeps the editor open.
+                        Ok(Some(filename)) => {
+                            finish_editor_save(
+                                &mut global,
+                                &mut actives,
+                                input_detect.mode(),
+                                &filename,
+                            );
                         }
                         Ok(None) => log::info!("Edit cancelled"),
                         Err(e) => log::error!("Editor error: {}", e),
                     }
                     // The editor stages prefs (snap distance/gap/nudge step) in memory;
                     // apply them so they survive until the single save on exit.
-                    if let Some((sd, sg, ns)) = config::take_editor_prefs() {
-                        global.snap_distance = sd.clamp(1, 100);
-                        global.snap_gap = sg.clamp(0, 50);
-                        global.nudge_step = ns.clamp(1, 100);
-                        log::info!("Editor prefs applied: snap_distance={}, snap_gap={}, nudge_step={}",
-                            global.snap_distance, global.snap_gap, global.nudge_step);
-                    }
+                    apply_editor_prefs(&mut global);
                 }
                 TrayCommand::EditConfig(filename) => {
                     log::info!("Editing existing config: {}", filename);
-                    let base_cfg = Config::load_from(&filename).unwrap_or_default();
-                    // Strip the .yml suffix as the initial filename (yaml support dropped)
-                    let stem = filename.trim_end_matches(".yml");
+                    // Do NOT fall back to a blank Config on load failure: saving that
+                    // blank document would overwrite the original (possibly recoverable)
+                    // file. Abort the edit and tell the user instead.
+                    let base_cfg = match Config::load_from(&filename) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            log::error!(
+                                "Failed to load config {} (editing aborted): {}",
+                                filename, e
+                            );
+                            dialog::error(
+                                HWND(std::ptr::null_mut()),
+                                i18n::t("load_failed"),
+                                &format!("{}\n\n{}", filename, e),
+                            );
+                            continue 'main;
+                        }
+                    };
+                    // Strip the .yml suffix as the initial filename (yaml support dropped).
+                    // Scan accepts .YML too, so strip case-insensitively; is_char_boundary
+                    // keeps a malformed non-ASCII name from panicking on slicing.
+                    let stem = match filename.len().checked_sub(4) {
+                        Some(i)
+                            if filename.is_char_boundary(i)
+                                && filename[i..].eq_ignore_ascii_case(".yml") =>
+                        {
+                            &filename[..i]
+                        }
+                        _ => filename.as_str(),
+                    };
                     match editor::run_editor(&base_cfg, stem) {
-                        Ok(Some((new_cfg, saved_name))) => {
-                            let _ = new_cfg.save_as(&saved_name);
-                            // Auto-enabled after editing (single-select: the only slot goes to this config, auto-switch yields)
-                            select_single_config(&mut global, &saved_name);
-                            sync_input_groups_to_tray(&global);
-                            // Drop other config windows, then reload this config (= automatic "reload config")
-                            apply_input_mode(&mut actives, &global, input_detect.mode());
-                            reload_or_activate(&mut actives, &saved_name);
-                            log::info!("Edit done, config: {}", saved_name);
+                        // run_editor writes the file itself and returns only after a
+                        // successful save; a write error keeps the editor open.
+                        Ok(Some(saved_name)) => {
+                            finish_editor_save(
+                                &mut global,
+                                &mut actives,
+                                input_detect.mode(),
+                                &saved_name,
+                            );
                         }
                         Ok(None) => log::info!("Edit cancelled"),
                         Err(e) => log::error!("Editor error: {}", e),
                     }
                     // The editor stages prefs (snap distance/gap/nudge step) in memory;
                     // apply them so they survive until the single save on exit.
-                    if let Some((sd, sg, ns)) = config::take_editor_prefs() {
-                        global.snap_distance = sd.clamp(1, 100);
-                        global.snap_gap = sg.clamp(0, 50);
-                        global.nudge_step = ns.clamp(1, 100);
-                        log::info!("Editor prefs applied: snap_distance={}, snap_gap={}, nudge_step={}",
-                            global.snap_distance, global.snap_gap, global.nudge_step);
-                    }
+                    apply_editor_prefs(&mut global);
                 }
                 TrayCommand::ToggleConfig(filename) => {
                     // Single-select model: at most 1 config in the manual set; greyed out while auto-switch is on, so this is unreachable
@@ -395,7 +520,7 @@ fn main() -> AppResult<()> {
                                 log::info!("Reloaded: {}", name);
                                 new_actives.push(ac);
                             }
-                            Err(e) => log::error!("Failed to reload config {}: {}", name, e),
+                            Err(e) => report_activation_failure(name, &e),
                         }
                     }
                     // Old actives drop here (OverlayWindow Drop destroys the window)
@@ -449,6 +574,17 @@ fn main() -> AppResult<()> {
             sync_tray_active_list(&actives);
         }
 
+        // (B3) Desktop resolution change. The DDA session reports the new size after
+        // its ACCESS_LOST rebuild. Overlay content uses user-chosen absolute screen
+        // coordinates, so rebuild the active windows (do not remap their geometry)
+        // and warn once about configs whose capture regions no longer fit.
+        if cap.width != screen_w || cap.height != screen_h {
+            let old = (screen_w, screen_h);
+            screen_w = cap.width;
+            screen_h = cap.height;
+            handle_resolution_change(&mut actives, old, (screen_w, screen_h));
+        }
+
         // (C) Collect all active configs' source regions; crop and read back on the GPU in one pass
         if actives.is_empty() {
             // With no active config there's nothing to poll at frame rate; sleep longer to save CPU (tray commands still respond promptly)
@@ -473,6 +609,9 @@ fn main() -> AppResult<()> {
             match cap.acquire_regions(0, &all_regions) {
                 Ok(Some(frames)) => {
                     consecutive_errors = 0;
+                    capture_error_since = None;
+                    capture_error_reported = false;
+                    dda_rebuild_reported = false;
                     stats.acquire_ms += acquire_t0.elapsed().as_secs_f64() * 1000.0;
                     stats.acquire_n += 1;
                     let num_actives = actives.len();
@@ -484,31 +623,29 @@ fn main() -> AppResult<()> {
                             frames.len()
                         };
                         let ac_frames = &frames[start..end];
+                        let is_static = ac.cfg.capture_regions.is_empty();
 
-                        let dib = ac.win.dib_ptr();
-                        let buf_len = ac.win.buf_len();
-                        unsafe { std::ptr::write_bytes(dib, 0, buf_len); }
-                        render_regions(
-                            ac_frames,
-                            &ac.cfg,
-                            dib,
-                            ac.ow,
-                            ac.oh,
-                            ac.cfg.effective_global_opacity(),
-                        );
-                        // Composite custom UI elements (already sorted by z_order)
-                        for ui in &ac.ui_elements {
-                            composite_ui(dib, ac.ow, ac.oh, ui);
+                        // A UI-only config is presented once; capture configs follow
+                        // every acquired frame. If this is the first present for a
+                        // static config, fall through so its UI actually appears even
+                        // when another config supplied the capture frame.
+                        if is_static && !ac.needs_static_present {
+                            continue;
                         }
+
                         let present_t0 = Instant::now();
-                        if let Err(e) = ac.win.present() {
-                            log::error!("Present failed [{}]: {}", ac.filename, e);
-                            stats.present_errors += 1;
-                            std::thread::sleep(Duration::from_millis(50));
-                        } else {
-                            stats.present_ms += present_t0.elapsed().as_secs_f64() * 1000.0;
-                            stats.present_n += 1;
-                            stats.acquired += 1;
+                        match render_config(ac, ac_frames) {
+                            Ok(()) => {
+                                stats.present_ms += present_t0.elapsed().as_secs_f64() * 1000.0;
+                                stats.present_n += 1;
+                                stats.acquired += 1;
+                                ac.present_fail_since = None;
+                                ac.present_fail_reported = false;
+                                if is_static {
+                                    ac.needs_static_present = false;
+                                }
+                            }
+                            Err(e) => note_present_failure(ac, &mut stats, &e),
                         }
                     }
                     // DWM source interval: delta of the frame's present timestamp vs the previous frame
@@ -528,14 +665,70 @@ fn main() -> AppResult<()> {
                     stats.acquire_wait_ms += cap.last_wait_ms;
                     stats.acquire_readback_ms += cap.last_readback_ms;
                 }
-                Ok(None) => stats.skipped += 1,
+                Ok(None) => {
+                    stats.skipped += 1;
+                    // No capture frame: this is the normal path for a UI-only config
+                    // (and for a static desktop). Present its content once instead of
+                    // waiting forever for Ok(Some(frames)).
+                    consecutive_errors = 0;
+                    capture_error_since = None;
+                    capture_error_reported = false;
+                    // ACCESS_LOST recovery failures also return Ok(None), so the generic
+                    // capture-error path never sees them. Report a persistent rebuild
+                    // failure once per streak (e.g. a game stuck in exclusive fullscreen).
+                    let rebuild_failures = cap.rebuild_failures();
+                    if rebuild_failures == 0 {
+                        dda_rebuild_reported = false;
+                    } else if rebuild_failures >= DDA_REBUILD_NOTICE_AFTER
+                        && !dda_rebuild_reported
+                    {
+                        dda_rebuild_reported = true;
+                        log::error!(
+                            "DDA session rebuild failed {} times in a row, overlay is frozen",
+                            rebuild_failures
+                        );
+                        dialog::error(
+                            HWND(std::ptr::null_mut()),
+                            i18n::t("capture_failed"),
+                            i18n::t("capture_rebuild_hint"),
+                        );
+                    }
+                    present_static_configs(&mut actives, &mut stats);
+                }
                 Err(e) => {
                     log::warn!("Frame capture failed: {}", e);
                     stats.errors += 1;
-                    consecutive_errors += 1;
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let since = *capture_error_since.get_or_insert_with(Instant::now);
+                    if !capture_error_reported
+                        && since.elapsed() >= RUNTIME_ERROR_NOTICE_AFTER
+                    {
+                        capture_error_reported = true;
+                        log::error!(
+                            "Frame capture has failed continuously for {}s: {}",
+                            since.elapsed().as_secs(),
+                            e
+                        );
+                        dialog::error(
+                            HWND(std::ptr::null_mut()),
+                            i18n::t("capture_failed"),
+                            &format!("{}\n\n{}", i18n::t("capture_retry_hint"), e),
+                        );
+                    }
+                    // UI-only configs do not depend on capture; keep them visible even
+                    // while the duplication session is recovering.
+                    present_static_configs(&mut actives, &mut stats);
+                    if consecutive_errors == MAX_CONSECUTIVE_ERRORS {
+                        log::error!(
+                            "{} consecutive frame capture failures, backing off and retrying",
+                            consecutive_errors
+                        );
+                    }
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        log::error!("{} consecutive frame capture failures, exiting safely", consecutive_errors);
-                        break;
+                        // Never exit on capture errors: a display-mode switch, UAC
+                        // desktop or driver reset can take seconds to recover. Keep the
+                        // overlay/tray alive and retry at a lower rate.
+                        std::thread::sleep(Duration::from_millis(500));
                     }
                 }
             }
@@ -571,7 +764,13 @@ fn main() -> AppResult<()> {
         // crash or force-kill only loses the last ≤5 minutes of changes (normal exit still saves).
         const SETTINGS_FLUSH_INTERVAL: Duration = Duration::from_secs(300);
         if last_settings_save.elapsed() >= SETTINGS_FLUSH_INTERVAL {
-            global.save();
+            if settings_writable {
+                if let Err(e) = global.save() {
+                    log::error!("Periodic settings save failed: {}", e);
+                }
+            } else {
+                log::warn!("Skipping periodic settings save: settings.yml was not loaded/preserved");
+            }
             last_settings_save = Instant::now();
             log::debug!("Periodic settings flush (every 5 min)");
         }
@@ -604,7 +803,20 @@ fn main() -> AppResult<()> {
     // Single save on exit: all in-memory mutations (fps/configs/auto-switch/groups/editor prefs)
     // are staged to avoid frequent disk writes (settings.yml is written exactly once here,
     // everything else runs on the in-memory copy).
-    global.save();
+    if settings_writable {
+        if let Err(e) = global.save() {
+            log::error!("Failed to save settings on exit: {}", e);
+            dialog::error(
+                HWND(std::ptr::null_mut()),
+                i18n::t("save_failed"),
+                &e.to_string(),
+            );
+        }
+    } else {
+        log::warn!(
+            "Skipping settings save on exit: settings.yml could not be read and was not backed up"
+        );
+    }
     log::info!("=== Program exiting ===");
     Ok(())
 }
@@ -615,6 +827,117 @@ fn fps_to_duration(fps: u32) -> Duration {
     // Guard: out-of-range fps yields inf/0 and panics; clamp to 1..=240
     let fps = fps.clamp(1, 240);
     Duration::from_secs_f32(1.0 / fps as f32)
+}
+
+/// Record an activation failure in the de-duplication set.
+/// Returns true the first time this exact filename+message pair is reported.
+fn mark_activation_error(filename: &str, message: &str) -> bool {
+    let key = format!("{}\u{1f}{}", filename, message);
+    let mut guard = match REPORTED_ACTIVATION_ERRORS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key)
+}
+
+/// Forget past failures for a config that just activated successfully.
+fn clear_activation_errors(filename: &str) {
+    let prefix = format!("{}\u{1f}", filename);
+    let mut guard = match REPORTED_ACTIVATION_ERRORS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(set) = guard.as_mut() {
+        set.retain(|key| !key.starts_with(&prefix));
+    }
+}
+
+/// Tell the user that a config failed to load/activate (once per unique error).
+fn report_activation_failure(filename: &str, err: &AppError) {
+    log::error!("Failed to activate config {}: {}", filename, err);
+    let message = err.to_string();
+    if !mark_activation_error(filename, &message) {
+        return;
+    }
+    dialog::error(
+        HWND(std::ptr::null_mut()),
+        i18n::t("config_activate_failed"),
+        &format!(
+            "{}\n\n{}: {}",
+            i18n::t("config_activate_hint"),
+            filename,
+            message
+        ),
+    );
+}
+
+/// Report UI pre-render failures for this config (once per filename+message).
+fn report_ui_errors(filename: &str, errors: &[String]) {
+    let prefix = format!("{}\u{1f}", filename);
+    let fresh: Vec<String> = {
+        let mut guard = match REPORTED_UI_ERRORS.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let set = guard.get_or_insert_with(std::collections::HashSet::new);
+        if errors.is_empty() {
+            // The config now renders cleanly: allow a future regression to be reported again.
+            set.retain(|key| !key.starts_with(&prefix));
+            Vec::new()
+        } else {
+            errors
+                .iter()
+                .filter(|error| set.insert(format!("{}{}", prefix, error)))
+                .cloned()
+                .collect()
+        }
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    log::error!(
+        "UI pre-render failed [{}]: {}",
+        filename,
+        fresh.join("; ")
+    );
+    dialog::error(
+        HWND(std::ptr::null_mut()),
+        i18n::t("ui_render_failed"),
+        &format!("{}\n\n{}", filename, fresh.join("\n")),
+    );
+}
+
+/// Count a present failure and warn the user when the streak lasts long enough.
+fn note_present_failure(ac: &mut ActiveConfig, stats: &mut FrameStats, err: &AppError) {
+    stats.present_errors += 1;
+    let now = Instant::now();
+    let first = ac.present_fail_since.is_none();
+    let since = *ac.present_fail_since.get_or_insert(now);
+    if first {
+        log::error!("Present failed [{}]: {}", ac.filename, err);
+    }
+    if !ac.present_fail_reported && now.duration_since(since) >= RUNTIME_ERROR_NOTICE_AFTER {
+        ac.present_fail_reported = true;
+        log::error!(
+            "Present has been failing for {}s [{}]: {}",
+            now.duration_since(since).as_secs(),
+            ac.filename,
+            err
+        );
+        dialog::error(
+            HWND(std::ptr::null_mut()),
+            i18n::t("present_failed"),
+            &format!(
+                "{}\n\n{}",
+                i18n::t("present_retry_hint").replace("{}", &ac.filename),
+                err
+            ),
+        );
+    }
+    // Back off a little; a failing UpdateLayeredWindow should not spin at frame rate.
+    std::thread::sleep(Duration::from_millis(50));
 }
 
 /// Load a config and create the overlay window + pre-rendered UI
@@ -641,13 +964,69 @@ fn activate_config(filename: &str) -> AppResult<ActiveConfig> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let mut ui_elements: Vec<custom_ui::RenderedUi> =
+    let (mut ui_elements, ui_errors) =
         prerender_ui(&cfg.custom_ui, &exe_dir, cfg.effective_global_opacity());
     ui_elements.sort_by_key(|r| r.z_order);
+    report_ui_errors(filename, &ui_errors);
     if !ui_elements.is_empty() {
         log::info!("Config {} pre-rendered {} UI elements", filename, ui_elements.len());
     }
-    Ok(ActiveConfig { filename: filename.to_string(), cfg, win, ui_elements, ow, oh })
+    clear_activation_errors(filename);
+    Ok(ActiveConfig {
+        filename: filename.to_string(),
+        cfg,
+        win,
+        ui_elements,
+        ow,
+        oh,
+        needs_static_present: true,
+        present_fail_since: None,
+        present_fail_reported: false,
+    })
+}
+
+/// Clear, render capture frames + custom UI, and present one overlay.
+/// Capture and static-UI configs share this path so a UI-only config cannot
+/// silently skip UpdateLayeredWindow just because there is no capture frame.
+fn render_config(ac: &ActiveConfig, frames: &[RegionFrame<'_>]) -> AppResult<()> {
+    let dib = ac.win.dib_ptr();
+    let buf_len = ac.win.buf_len();
+    unsafe { std::ptr::write_bytes(dib, 0, buf_len); }
+    render_regions(
+        frames,
+        &ac.cfg,
+        dib,
+        ac.ow,
+        ac.oh,
+        ac.cfg.effective_global_opacity(),
+    );
+    for ui in &ac.ui_elements {
+        composite_ui(dib, ac.ow, ac.oh, ui);
+    }
+    ac.win.present()
+}
+
+/// Present configs that have no capture regions (pure frame/background/image/text).
+/// They are static, so one successful present is enough; the flag is cleared only
+/// after success so a transient present failure is retried.
+fn present_static_configs(actives: &mut [ActiveConfig], stats: &mut FrameStats) {
+    let no_frames: &[RegionFrame<'_>] = &[];
+    for ac in actives.iter_mut() {
+        if !ac.cfg.capture_regions.is_empty() || !ac.needs_static_present {
+            continue;
+        }
+        let t0 = Instant::now();
+        match render_config(ac, no_frames) {
+            Ok(()) => {
+                stats.present_ms += t0.elapsed().as_secs_f64() * 1000.0;
+                stats.present_n += 1;
+                ac.present_fail_since = None;
+                ac.present_fail_reported = false;
+                ac.needs_static_present = false;
+            }
+            Err(e) => note_present_failure(ac, stats, &e),
+        }
+    }
 }
 
 /// Sync the active config list to the tray (for menu check marks)
@@ -662,6 +1041,80 @@ fn sync_input_groups_to_tray(gs: &GlobalSettings) {
         gs.input_auto_switch,
         gs.keyboard_configs.clone(),
         gs.controller_configs.clone(),
+    );
+}
+
+/// Apply the editor prefs staged in memory (snap distance/gap/nudge step). Settings
+/// are normally written once on exit, so these must be merged into the live copy.
+fn apply_editor_prefs(global: &mut GlobalSettings) {
+    if let Some((sd, sg, ns)) = config::take_editor_prefs() {
+        global.snap_distance = sd.clamp(1, 100);
+        global.snap_gap = sg.clamp(0, 50);
+        global.nudge_step = ns.clamp(1, 100);
+        log::info!(
+            "Editor prefs applied: snap_distance={}, snap_gap={}, nudge_step={}",
+            global.snap_distance,
+            global.snap_gap,
+            global.nudge_step
+        );
+    }
+}
+
+/// Common tail of both editor entry points (new config / edit existing): the saved
+/// file becomes the single active config (auto-switch yields), old windows are
+/// dropped, the file is reloaded, and the staged editor prefs are applied.
+fn finish_editor_save(
+    global: &mut GlobalSettings,
+    actives: &mut Vec<ActiveConfig>,
+    mode: InputMode,
+    filename: &str,
+) {
+    select_single_config(global, filename);
+    sync_input_groups_to_tray(global);
+    apply_input_mode(actives, global, mode);
+    reload_or_activate(actives, filename);
+    apply_editor_prefs(global);
+    log::info!("Edit done, config: {}", filename);
+}
+
+/// Rebuild every active overlay after a desktop resolution change. Content keeps
+/// its absolute screen coordinates (user-chosen, not a layout to remap). Configs
+/// whose capture source now lies outside the screen are reported once: their
+/// out-of-screen part renders black (the capture side clamps it).
+fn handle_resolution_change(actives: &mut Vec<ActiveConfig>, old: (u32, u32), new: (u32, u32)) {
+    log::info!(
+        "Desktop resolution changed: {}x{} -> {}x{}",
+        old.0,
+        old.1,
+        new.0,
+        new.1
+    );
+    let names: Vec<String> = actives.iter().map(|a| a.filename.clone()).collect();
+    for name in &names {
+        reload_or_activate(actives, name);
+    }
+    let out_of_bounds: Vec<String> = actives
+        .iter()
+        .filter(|a| !a.cfg.capture_regions_fit(new.0, new.1))
+        .map(|a| a.filename.clone())
+        .collect();
+    if out_of_bounds.is_empty() {
+        return;
+    }
+    log::warn!(
+        "Capture regions outside the {}x{} screen: {}",
+        new.0,
+        new.1,
+        out_of_bounds.join(", ")
+    );
+    let text = i18n::t("resolution_changed_hint")
+        .replace("{old}", &format!("{}x{}", old.0, old.1))
+        .replace("{new}", &format!("{}x{}", new.0, new.1))
+        .replace("{list}", &out_of_bounds.join("\n"));
+    dialog::warning(
+        HWND(std::ptr::null_mut()),
+        i18n::t("resolution_changed"),
+        &text,
     );
 }
 
@@ -720,7 +1173,7 @@ fn apply_input_mode(actives: &mut Vec<ActiveConfig>, gs: &GlobalSettings, mode: 
                     log::info!("Config activated: {}", name);
                     actives.push(ac);
                 }
-                Err(e) => log::error!("Failed to activate config {}: {}", name, e),
+                Err(e) => report_activation_failure(name, &e),
             }
         }
     }
@@ -739,7 +1192,7 @@ fn reload_or_activate(actives: &mut Vec<ActiveConfig>, filename: &str) {
             }
             log::info!("Config reloaded: {}", filename);
         }
-        Err(e) => log::error!("Failed to reload config {}: {}", filename, e),
+        Err(e) => report_activation_failure(filename, &e),
     }
     sync_tray_active_list(actives);
 }

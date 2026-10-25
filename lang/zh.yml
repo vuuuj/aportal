@@ -80,6 +80,28 @@ overwrite_ask: 已存在，是否覆盖？
 yes_overwrite: 是，覆盖
 no: 否
 
+# error dialogs
+load_failed: 无法加载配置
+save_failed: 保存失败
+startup_failed: 启动失败
+already_running: APortal 已在运行
+already_running_hint: "当前用户会话中已经有一个 APortal 在运行。\n\n请在任务栏通知区域（系统托盘）查看 APortal 图标。"
+settings_load_failed: 设置文件读取失败
+settings_backup_hint: "已使用默认设置。原文件已备份为：\n{}\n\n错误：{}"
+settings_no_write_hint: "已使用默认设置，但原文件无法备份，本次不会写回设置。\n\n错误：{}"
+config_activate_failed: 配置加载失败
+config_activate_hint: "以下配置未能加载："
+ui_render_failed: UI 元素渲染失败
+capture_failed: 屏幕捕获异常
+capture_retry_hint: "屏幕捕获连续失败，程序将继续重试。"
+capture_rebuild_hint: "桌面捕获会话已丢失，且暂时无法重建（常见于独占全屏游戏）。\n程序会继续重试，切回窗口模式后通常会自动恢复；在此期间 overlay 不会刷新。"
+present_failed: 画面显示异常
+present_retry_hint: "配置 {} 的画面连续更新失败，overlay 可能无法刷新；程序将继续重试。"
+resolution_changed: 分辨率已变化
+resolution_changed_hint: "桌面分辨率已从 {old} 变为 {new}。\n\n以下配置的捕获区域超出新屏幕，超出部分会显示为黑色：\n{list}\n\n请重新编辑这些配置并调整捕获区域。"
+empty_config_title: 空配置
+empty_config_ask: "当前配置没有任何区域或 UI 元素。\n仍要保存空配置吗？"
+
 # misc
 no_image: 未设置图片
 

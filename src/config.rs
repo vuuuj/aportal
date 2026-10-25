@@ -6,6 +6,9 @@
 //!
 //! Each region config file holds only region data; on/off state lives centrally in settings.yml.
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
@@ -99,65 +102,231 @@ impl Default for GlobalSettings {
     }
 }
 
-/// Default config filename
-/// Default file name used when a new config is saved with an empty name
-pub const UNNAMED_CONFIG: &str = "未命名.yml";
 /// Global settings filename
 pub const SETTINGS_FILE: &str = "settings.yml";
 /// Legacy global settings filename (v0.0.4 and earlier); auto-migrated to settings.yml on first load if present
 const LEGACY_SETTINGS_FILE: &str = "settings.yaml";
+/// Longest accepted config file name (UTF-16 units), matching the Windows component limit
+const MAX_CONFIG_FILENAME_UNITS: usize = 255;
+
+/// Validate a region-config filename that will be joined to the exe directory.
+///
+/// The editor's filename box used to accept arbitrary text, so names like
+/// `..\..\settings.yml` escaped the exe directory and could overwrite the global
+/// settings (or any other file the process can write). Accept only one plain
+/// file name with a `.yml` suffix, and reserve the global settings file.
+pub fn validate_config_filename(filename: &str) -> AppResult<()> {
+    let invalid = |reason: &str| {
+        Err(AppError::other(format!(
+            "invalid config file name {:?}: {}",
+            filename, reason
+        )))
+    };
+
+    if filename.is_empty() {
+        return invalid("the name is empty");
+    }
+    if filename.encode_utf16().count() > MAX_CONFIG_FILENAME_UNITS {
+        return invalid("the name is too long");
+    }
+    if filename.eq_ignore_ascii_case(SETTINGS_FILE) {
+        return invalid("this name is reserved for the global settings");
+    }
+
+    let lower = filename.to_ascii_lowercase();
+    if !lower.ends_with(".yml") {
+        return invalid("the name must end with .yml");
+    }
+    // The suffix is ASCII, so len - 4 is always a char boundary
+    let stem = &filename[..filename.len() - 4];
+    if stem.is_empty() {
+        return invalid("the name has no stem");
+    }
+    if stem.ends_with('.') || stem.ends_with(' ') {
+        return invalid("the name must not end with a dot or space");
+    }
+    if stem
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+    {
+        return invalid("the name contains characters that are not allowed in Windows file names");
+    }
+
+    // Reject any directory prefix ("a/b.yml", "C:foo.yml", "..\\foo.yml", ...)
+    let mut components = std::path::Path::new(filename).components();
+    let plain = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !plain {
+        return invalid("the name must not contain a directory path");
+    }
+
+    // CON.yml, NUL.yml, COM1.yml, ... are DOS device names, not files
+    let base = stem.split('.').next().unwrap_or("").trim_end();
+    if matches!(
+        base.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return invalid("the name is a reserved Windows device name");
+    }
+
+    Ok(())
+}
+
+/// Result of loading settings.yml.
+///
+/// `error` is deliberately kept separate from the settings value: a parse failure
+/// used to look identical to a first run, so the next save silently replaced the
+/// user's (possibly recoverable) file with defaults.
+pub struct SettingsLoad {
+    /// Parsed settings, or defaults when the file is missing/unreadable.
+    pub settings: GlobalSettings,
+    /// Set when settings.yml exists but could not be read/parsed.
+    pub error: Option<String>,
+    /// Preserved copy when a broken file was moved aside.
+    pub backup: Option<PathBuf>,
+}
+
+impl SettingsLoad {
+    /// Writing is safe on a first run, after a successful load, or after the broken
+    /// file was moved aside. If the original could not be preserved, keep it intact
+    /// and never overwrite it with defaults.
+    pub fn can_write(&self) -> bool {
+        self.error.is_none() || self.backup.is_some()
+    }
+}
 
 impl GlobalSettings {
-    /// Load settings.yml from the exe directory; None when the file doesn't exist (distinguishes first run).
+    /// Load settings.yml and preserve a broken file so the next save cannot destroy it.
+    /// Used by the main program, which owns writes to settings.yml.
+    pub fn load_with_status() -> SettingsLoad {
+        Self::load_settings(true)
+    }
+
+    /// Load settings.yml for read-only callers (editor preferences).
+    /// Never moves/renames the file: opening the editor must not have side effects.
+    pub fn load() -> Self {
+        Self::load_settings(false).settings
+    }
+
+    /// Load settings.yml from the exe directory, reporting parse/read failures.
     /// Backwards-compatible with legacy settings.yaml: if present, read and rename to settings.yml (one-time migration).
-    pub fn load_optional() -> Option<Self> {
+    /// `can_modify=false` is for read-only callers: never rename/back up the file.
+    fn load_settings(can_modify: bool) -> SettingsLoad {
+        let defaults = || SettingsLoad {
+            settings: GlobalSettings::default(),
+            error: None,
+            backup: None,
+        };
+
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
                 // Legacy yaml migration: only when yml is missing but yaml exists
-                if !dir.join(SETTINGS_FILE).exists() && dir.join(LEGACY_SETTINGS_FILE).exists() {
+                if can_modify
+                    && !dir.join(SETTINGS_FILE).exists()
+                    && dir.join(LEGACY_SETTINGS_FILE).exists()
+                {
                     let _ = std::fs::rename(dir.join(LEGACY_SETTINGS_FILE), dir.join(SETTINGS_FILE));
                     log::info!("Legacy {} migrated to {}", LEGACY_SETTINGS_FILE, SETTINGS_FILE);
                 }
                 let path = dir.join(SETTINGS_FILE);
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    // Guard: users may save with editors that add a BOM; strip it to avoid serde_yml parse failure
-                    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
-                    if let Ok(mut gs) = serde_yml::from_str::<GlobalSettings>(content) {
-                        // Guard: clamp out-of-range fps to avoid a from_secs_f32(inf) panic
-                        gs.fps = gs.fps.clamp(1, 240);
-                        log::info!("Global settings loaded: fps={}, enabled configs={}",
-                            gs.fps, gs.enabled_configs.len());
-                        return Some(gs);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        // Guard: users may save with editors that add a BOM; strip it to avoid serde_yml parse failure
+                        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+                        match serde_yml::from_str::<GlobalSettings>(content) {
+                            Ok(mut gs) => {
+                                // Guard: clamp out-of-range fps to avoid a from_secs_f32(inf) panic
+                                gs.fps = gs.fps.clamp(1, 240);
+                                log::info!("Global settings loaded: fps={}, enabled configs={}",
+                                    gs.fps, gs.enabled_configs.len());
+                                return SettingsLoad {
+                                    settings: gs,
+                                    error: None,
+                                    backup: None,
+                                };
+                            }
+                            Err(e) => {
+                                let msg = format!(
+                                    "Failed to parse {}: {}",
+                                    path.display(), e
+                                );
+                                log::error!("{}", msg);
+                                let backup = if can_modify {
+                                    preserve_bad_settings(dir)
+                                } else {
+                                    None
+                                };
+                                return SettingsLoad {
+                                    settings: GlobalSettings::default(),
+                                    error: Some(msg),
+                                    backup,
+                                };
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Normal first run: no file to protect
+                        log::info!("Global settings not found, using defaults");
+                        return defaults();
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to read {}: {}", path.display(), e);
+                        log::error!("{}", msg);
+                        // Invalid UTF-8 is a broken file worth preserving; other I/O
+                        // errors (sharing violation, permission denied) are left alone.
+                        let backup = if can_modify && e.kind() == std::io::ErrorKind::InvalidData {
+                            preserve_bad_settings(dir)
+                        } else {
+                            None
+                        };
+                        return SettingsLoad {
+                            settings: GlobalSettings::default(),
+                            error: Some(msg),
+                            backup,
+                        };
                     }
                 }
             }
         }
         log::info!("Global settings not found, using defaults");
-        None
+        defaults()
     }
 
-    /// Load settings.yml from the exe directory; return defaults when missing.
-    pub fn load() -> Self {
-        Self::load_optional().unwrap_or_default()
-    }
-
-    /// Save to settings.yml in the exe directory
-    pub fn save(&self) {
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(dir) = exe_path.parent() {
-                let path = dir.join(SETTINGS_FILE);
-                match serde_yml::to_string(self) {
-                    Ok(yaml) => {
-                        if let Err(e) = std::fs::write(&path, &yaml) {
-                            log::error!("Failed to write global settings: {}", e);
-                        } else {
-                            log::info!("Global settings saved: fps={}", self.fps);
-                        }
-                    }
-                    Err(e) => log::error!("Failed to serialize global settings: {}", e),
-                }
-            }
-        }
+    /// Save to settings.yml in the exe directory (atomic replace).
+    pub fn save(&self) -> AppResult<()> {
+        let exe_path = std::env::current_exe()
+            .map_err(|e| AppError::other(format!("Failed to get the exe path: {}", e)))?;
+        let dir = exe_path
+            .parent()
+            .ok_or_else(|| AppError::other("Failed to get the exe directory"))?;
+        let path = dir.join(SETTINGS_FILE);
+        let yaml = serde_yml::to_string(self)
+            .map_err(|e| AppError::other(format!("Failed to serialize global settings: {}", e)))?;
+        write_atomic(&path, yaml.as_bytes())
+            .map_err(|e| AppError::other(format!("Failed to write {}: {}", path.display(), e)))?;
+        log::info!("Global settings saved: fps={}", self.fps);
+        Ok(())
     }
 
     /// Check whether the given config file is enabled
@@ -185,7 +354,8 @@ impl GlobalSettings {
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let exists_ok = |name: &str| {
-            !name.to_ascii_lowercase().ends_with(".yaml")
+            validate_config_filename(name).is_ok()
+                && !name.to_ascii_lowercase().ends_with(".yaml")
                 && exe_dir
                     .as_ref()
                     .map(|d| d.join(name).exists())
@@ -202,6 +372,62 @@ impl GlobalSettings {
         }
         changed
     }
+}
+
+/// Move a broken settings.yml aside so the defaults written on exit cannot destroy
+/// the original file. Returns the backup path when the rename succeeded.
+fn preserve_bad_settings(dir: &Path) -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut dst = dir.join(format!("{}.bad-{}", SETTINGS_FILE, stamp));
+    let mut suffix = 1u32;
+    while dst.exists() {
+        dst = dir.join(format!("{}.bad-{}-{}", SETTINGS_FILE, stamp, suffix));
+        suffix = suffix.saturating_add(1);
+        if suffix > 1000 {
+            log::error!("Could not find a free backup name for {}", SETTINGS_FILE);
+            return None;
+        }
+    }
+    match std::fs::rename(dir.join(SETTINGS_FILE), &dst) {
+        Ok(()) => {
+            log::warn!("Broken {} preserved as {}", SETTINGS_FILE, dst.display());
+            Some(dst)
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to preserve broken {} (it will not be overwritten): {}",
+                SETTINGS_FILE, e
+            );
+            None
+        }
+    }
+}
+
+/// Write a file atomically: write a sibling temp file, flush it, then rename over
+/// the destination. A crash/power loss can leave a temp file, but never a truncated
+/// config. Windows' rename replaces an existing destination atomically enough for
+/// this single-writer use case.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("config"));
+    let tmp = dir.join(format!(".{}.{}.tmp", name, std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Editor snap distance/gap/nudge step, staged in a shared slot instead of writing to disk.
@@ -246,25 +472,6 @@ pub struct Settings {
     /// Global opacity 0.0~1.0 (defaults to 1.0 when unset; elements without opacity inherit it)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_opacity: Option<f32>,
-    /// Overlay window anchor: the origin of the content coordinate system lands at screen (x, y). Size is no longer hand-written; it's auto-fitted to the content bounding box.
-    /// Defaults to (0,0) when unset (content coordinates equal screen coordinates).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window: Option<WindowConfig>,
-}
-
-/// Overlay window anchor (right/bottom sizes deprecated, only x/y are read; width/height kept for legacy files)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WindowConfig {
-    pub x: i32,
-    pub y: i32,
-    #[serde(rename = "w", alias = "width", default, skip_serializing_if = "is_zero_i32")]
-    pub width: i32,
-    #[serde(rename = "h", alias = "height", default, skip_serializing_if = "is_zero_i32")]
-    pub height: i32,
-}
-
-fn is_zero_i32(v: &i32) -> bool {
-    *v == 0
 }
 
 /// Lightweight PNG size read (IHDR chunk only, no full decode)
@@ -735,6 +942,9 @@ fn parse_config_filtered(content: &str) -> AppResult<Config> {
 impl Config {
     /// Write the config to the given filename in the exe directory
     pub fn save_as(&self, filename: &str) -> AppResult<()> {
+        // The filename may come from user input: never join a path that can escape
+        // the exe directory or overwrite settings.yml.
+        validate_config_filename(filename)?;
         let exe_path = std::env::current_exe()
             .map_err(|e| AppError::other(format!("Failed to get the exe path: {}", e)))?;
         let exe_dir = exe_path
@@ -744,7 +954,7 @@ impl Config {
         let yaml = self
             .to_compact_yaml()
             .map_err(|e| AppError::other(format!("Failed to serialize config: {}", e)))?;
-        std::fs::write(&config_path, &yaml)
+        write_atomic(&config_path, yaml.as_bytes())
             .map_err(|e| AppError::other(format!("Failed to write config file: {}", e)))?;
         log::info!("Config saved: {}", config_path.display());
         Ok(())
@@ -759,6 +969,9 @@ impl Config {
 
     /// Load a config from the given file in the exe directory
     pub fn load_from(filename: &str) -> AppResult<Self> {
+        // Config names come from settings.yml / the tray; reject paths that escape
+        // the exe directory instead of reading arbitrary files.
+        validate_config_filename(filename)?;
         let exe_path = std::env::current_exe()
             .map_err(|e| AppError::other(format!("Failed to get the exe path: {}", e)))?;
         let exe_dir = exe_path
@@ -768,8 +981,20 @@ impl Config {
 
         let content = std::fs::read_to_string(&config_path)
             .map_err(|e| AppError::other(format!("Failed to read config file {}: {}", config_path.display(), e)))?;
-
-        let mut config: Config = parse_config_filtered(&content)?;
+        // Editors may leave a UTF-8 BOM; strip it so an otherwise valid file is editable
+        let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+        // A file with no data (empty or comments only) has nothing to protect: open an
+        // empty editor instead of aborting. Malformed files with real content still fail
+        // so the caller never overwrites them with a blank document.
+        let blank = content.lines().all(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with('#')
+        });
+        let mut config: Config = if blank {
+            Config::default()
+        } else {
+            parse_config_filtered(content)?
+        };
 
         config.validate();
         log::info!("Config loaded: {}", config_path.display());
@@ -783,25 +1008,19 @@ impl Config {
 
     /// Resolve "element opacity (possibly None)" to an effective value:
     /// element set → use it; unset → use global_opacity; neither set → 1.0
-    #[allow(dead_code)]
     pub fn effective_opacity(&self, elem: Option<f32>) -> f32 {
         elem.unwrap_or(self.effective_global_opacity())
     }
 
     /// Compute the overlay window rect (position + auto size).
-    /// Position = settings.window anchor (x, y), (0,0) when unset; content coordinates are window coordinates, presented as-is.
+    /// Position = (0,0): content coordinates equal screen coordinates (the legacy settings.window anchor was removed).
     /// Size = max right/bottom extent of the content (window.width/height no longer used).
     /// When image/text lack width/height, use their PNG intrinsic size / measured text size so the window bottom isn't truncated.
     /// Returns (x, y, w, h). Returns 200x150 when there's no content.
     /// NOTE (v0.0.9): the runtime overlay window no longer uses this function (tight_bounds
     /// is used instead); this one is kept for the editor's canvas viewport.
     pub fn overlay_bounds(&self) -> (i32, i32, i32, i32) {
-        let (wx, wy) = self
-            .settings
-            .window
-            .as_ref()
-            .map(|w| (w.x, w.y))
-            .unwrap_or((0, 0));
+        let (wx, wy) = (0, 0);
         let mut max_x = 0i32;
         let mut max_y = 0i32;
 
@@ -862,6 +1081,19 @@ impl Config {
             return (0, 0, 200, 150);
         }
         (min_x, min_y, (max_x - min_x).max(1), (max_y - min_y).max(1))
+    }
+
+    /// Whether every capture source region lies fully inside a `width` x `height`
+    /// screen. Checked after a display-mode change: the runtime clamps out-of-screen
+    /// source pixels (they render black), so the user should be told once which
+    /// configs need their capture regions adjusted. UI-only configs always fit.
+    pub fn capture_regions_fit(&self, width: u32, height: u32) -> bool {
+        self.capture_regions.iter().all(|r| {
+            let s = &r.source;
+            // u64 arithmetic: a corrupt/huge x + w must not wrap around and pass
+            (s.x as u64 + s.width as u64) <= width as u64
+                && (s.y as u64 + s.height as u64) <= height as u64
+        })
     }
 
     /// Compute the actual footprint rect (x, y, w, h) of a single custom_ui element.
@@ -968,7 +1200,9 @@ pub fn scan_config_files() -> Vec<String> {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     if let Some(ext) = entry.path().extension() {
-                        if ext == "yml" {
+                        // Windows file names are case-insensitive: Config.YML is the
+                        // same file a user would expect the app to load.
+                        if ext.to_str().is_some_and(|e| e.eq_ignore_ascii_case("yml")) {
                             if let Some(name) = entry.file_name().to_str() {
                                 // Exclude the global settings file
                                 if name != SETTINGS_FILE {
@@ -990,6 +1224,44 @@ pub fn scan_config_files() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_filename_validation_blocks_traversal_and_settings() {
+        for good in ["normal.yml", "配置 1.yml", "v1.2.yml", "my-config.yml"] {
+            assert!(
+                validate_config_filename(good).is_ok(),
+                "{} should be accepted",
+                good
+            );
+        }
+        for bad in [
+            "",
+            "settings.yml",
+            "SETTINGS.YML",
+            "../evil.yml",
+            "..\\evil.yml",
+            "sub/evil.yml",
+            "sub\\evil.yml",
+            "C:evil.yml",
+            "evil.yml:stream",
+            "evil?.yml",
+            "evil*.yml",
+            "evil.yml.",
+            "evil .yml ",
+            ".yml",
+            "CON.yml",
+            "nul.yml",
+            "COM1.yml",
+            "LPT9.yml",
+            "config.yaml",
+        ] {
+            assert!(
+                validate_config_filename(bad).is_err(),
+                "{:?} must be rejected",
+                bad
+            );
+        }
+    }
 
     #[test]
     fn text_content_accepts_bare_number() {
@@ -1084,7 +1356,7 @@ custom_ui:
             })],
         })
         .unwrap();
-        // Look only at the image element section (width/height under settings.window are window sizes, unrelated to elements)
+        // Look only at the image element section (w/h there are element sizes, unrelated to legacy window sizes)
         let img_section = yaml
             .split("custom_ui:")
             .nth(1)
@@ -1101,7 +1373,6 @@ custom_ui:
         let yaml = r#"
 settings:
   global_opacity: 0.65
-  window: {x: 20, 'y': 20, w: 1972, h: 1187}
 capture_regions:
 - id: region_1
   source: {x: 1492, 'y': 461, w: 230, h: 176}
@@ -1137,12 +1408,12 @@ custom_ui:
     #[test]
     fn compact_yaml_writer_uses_short_names_and_inline_rect() {
         let cfg: Config = serde_yml::from_str(
-            "settings:\n  global_opacity: 0.65\n  window: {x: 20, y: 20, w: 1972, h: 1187}\ncapture_regions:\n- id: a\n  source: {x: 0, y: 0, w: 10, h: 10}\n  display: {x: 1360, y: 475, w: 230, h: 176}\n  z: 3\n",
+            "settings:\n  global_opacity: 0.65\ncapture_regions:\n- id: a\n  source: {x: 0, y: 0, w: 10, h: 10}\n  display: {x: 1360, y: 475, w: 230, h: 176}\n  z: 3\n",
         )
         .unwrap();
         let yaml = cfg.to_compact_yaml().expect("compact serialization");
-        // window anchor x/y must be kept (window position is auto-derived from the content bounding box; sizes are ignored)
-        assert!(yaml.contains("window: {x: 20, 'y': 20"), "should output the window anchor: {}", yaml);
+        // settings.window was removed (v0.1.1): the overlay anchor is fixed at (0,0), auto-fitted to content
+        assert!(!yaml.contains("window:"), "must not output the legacy window entry: {}", yaml);
         // Geometry rects collapse to single-line flow (z always written: 0 → explicit level control)
         assert!(yaml.contains("source: {x: 0, 'y': 0, w: 10, h: 10}"), "{}", yaml);
         assert!(yaml.contains("display: {x: 1360, 'y': 475, w: 230, h: 176, z: 0}"), "{}", yaml);
@@ -1160,6 +1431,7 @@ custom_ui:
     #[test]
     fn old_file_with_width_height_z_order_still_loads() {
         // Old format: block-form rects + width/height/z_order entries
+        // settings.window is a removed field: kept here to prove legacy files still load (unknown fields are ignored)
         let yaml = r#"
 settings:
   global_opacity: 1.0
@@ -1186,8 +1458,8 @@ capture_regions:
         assert_eq!(cfg.capture_regions[0].source.width, 10);
         assert_eq!(cfg.capture_regions[0].display.width, 12);
         assert_eq!(cfg.capture_regions[0].z_order, Some(5), "legacy top-level z_order read into the Option field");
-        // Position = window anchor (20,20); size = max content extent (display 3,4,12,13 → 15x17), ignoring width/height
-        assert_eq!(cfg.overlay_bounds(), (20, 20, 15, 17));
+        // Anchor is fixed at (0,0) since the settings.window removal; size = max content extent (display 3,4,12,13 → 15x17)
+        assert_eq!(cfg.overlay_bounds(), (0, 0, 15, 17));
     }
 
     #[test]
@@ -1352,6 +1624,116 @@ capture_regions:
     fn tight_bounds_empty_content_falls_back() {
         let cfg = Config::default();
         assert_eq!(cfg.tight_bounds(), (0, 0, 200, 150));
+    }
+
+    fn test_region(x: u32, y: u32, width: u32, height: u32) -> CaptureRegion {
+        CaptureRegion {
+            id: "r".to_string(),
+            source: Rect { x, y, width, height },
+            display: DisplayRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                z_order: 0,
+                opacity: None,
+                rotate: 0,
+            },
+            z_order: None,
+        }
+    }
+
+    #[test]
+    fn capture_regions_fit_accepts_inside_and_touching_edges() {
+        let mut cfg = Config::default();
+        assert!(cfg.capture_regions_fit(1920, 1080), "no regions always fits");
+
+        // The bottom-right corner may end exactly on the screen edge
+        cfg.capture_regions.push(test_region(1820, 1040, 100, 40));
+        assert!(cfg.capture_regions_fit(1920, 1080));
+    }
+
+    #[test]
+    fn capture_regions_fit_rejects_overflow_on_either_axis() {
+        let mut right = Config::default();
+        right.capture_regions.push(test_region(1900, 0, 30, 10));
+        assert!(!right.capture_regions_fit(1920, 1080), "right edge overflow");
+
+        let mut bottom = Config::default();
+        bottom.capture_regions.push(test_region(0, 1070, 10, 20));
+        assert!(!bottom.capture_regions_fit(1920, 1080), "bottom edge overflow");
+    }
+
+    #[test]
+    fn capture_regions_fit_requires_every_region_to_fit() {
+        let mut cfg = Config::default();
+        cfg.capture_regions.push(test_region(0, 0, 100, 100));
+        cfg.capture_regions.push(test_region(1819, 500, 200, 100));
+        assert!(!cfg.capture_regions_fit(1920, 1080));
+    }
+
+    #[test]
+    fn capture_regions_fit_handles_u32_extremes() {
+        let mut cfg = Config::default();
+        // x + w would wrap around u32; the check must still reject it
+        cfg.capture_regions.push(test_region(u32::MAX, 0, 10, 10));
+        assert!(!cfg.capture_regions_fit(1920, 1080));
+        assert!(!cfg.capture_regions_fit(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn atomic_write_replaces_file_and_leaves_no_temp() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aportal-atomic-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.yml");
+        std::fs::write(&path, b"old").unwrap();
+
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+
+        let temps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "temporary file was not cleaned up");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn settings_load_only_writes_when_the_bad_file_was_preserved() {
+        let ok = SettingsLoad {
+            settings: GlobalSettings::default(),
+            error: None,
+            backup: None,
+        };
+        assert!(ok.can_write(), "normal load / first run must be writable");
+
+        let unsaved = SettingsLoad {
+            settings: GlobalSettings::default(),
+            error: Some("parse error".to_string()),
+            backup: None,
+        };
+        assert!(
+            !unsaved.can_write(),
+            "a broken file that could not be preserved must not be overwritten"
+        );
+
+        let preserved = SettingsLoad {
+            settings: GlobalSettings::default(),
+            error: Some("parse error".to_string()),
+            backup: Some(PathBuf::from("settings.yml.bad-1")),
+        };
+        assert!(preserved.can_write(), "backup succeeded, defaults may be written");
     }
 
     #[test]

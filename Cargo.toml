@@ -1,6 +1,6 @@
 ﻿[package]
 name = "aportal"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "APortal - 屏幕区域重组显示工具"
 
@@ -22,8 +22,10 @@ panic = "unwind"
 # Windows API 绑定 - 最小原型只需 DXGI + D3D11 + GDI(UpdateLayeredWindow) + 窗口
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
+    "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",

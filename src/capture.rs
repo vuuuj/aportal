@@ -7,7 +7,9 @@
 //!    zero readback, zero rendering
 
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     D3D11_BOX, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CPU_ACCESS_READ,
@@ -27,6 +29,10 @@ use crate::error::{AppError, AppResult};
 const DXGI_ERROR_WAIT_TIMEOUT: i32 = 0x887A0027u32 as i32;
 const DXGI_ERROR_ACCESS_LOST: i32 = 0x887A0026u32 as i32;
 const D3D11_SDK_VERSION: u32 = 7;
+/// D3D11 texture limit: 16384 on feature level 11, 8192 on feature level 10.
+/// The actual value is selected from ID3D11Device::GetFeatureLevel() at runtime.
+const STAGING_DIM_FL11: u32 = 16384;
+const STAGING_DIM_FL10: u32 = 8192;
 
 /// Source region to capture (absolute screen coordinates)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +58,45 @@ struct RegionSlot {
     h: u32,
     /// X offset (pixels) inside the merged staging texture
     x_offset: u32,
+    /// Y offset (pixels) inside the merged staging texture (row packing)
+    y_offset: u32,
+}
+
+/// RAII guard for one acquired Desktop Duplication frame.
+/// Every early return between AcquireNextFrame and the success path releases the frame
+/// automatically; otherwise the next AcquireNextFrame gets E_INVALIDARG and the main
+/// loop reaches its consecutive-error limit.
+struct FrameLease {
+    duplication: IDXGIOutputDuplication,
+    active: bool,
+}
+
+impl FrameLease {
+    fn new(duplication: &IDXGIOutputDuplication) -> Self {
+        Self {
+            duplication: duplication.clone(),
+            active: true,
+        }
+    }
+
+    fn release(mut self) -> AppResult<()> {
+        self.active = false;
+        unsafe {
+            self.duplication
+                .ReleaseFrame()
+                .map_err(|e| AppError::windows("ReleaseFrame", e))
+        }
+    }
+}
+
+impl Drop for FrameLease {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = self.duplication.ReleaseFrame();
+            }
+        }
+    }
 }
 
 /// DXGI Desktop Duplication capturer (region-level GPU crop + merged staging)
@@ -67,6 +112,8 @@ pub struct DxgiCapture {
     staging: Vec<Option<ID3D11Texture2D>>,
     staging_w: u32,
     staging_h: u32,
+    /// Maximum texture width/height for this device (16384 on FL11, 8192 on FL10)
+    max_staging_dim: u32,
     /// Successfully acquired (copied) frame counter; its parity selects the write/read buffer
     acquired_seq: u64,
     /// Per-region CPU buffers
@@ -200,6 +247,11 @@ impl DxgiCapture {
             let duplication = output1
                 .DuplicateOutput(&device)
                 .map_err(|e| AppError::windows("DuplicateOutput", e))?;
+            let max_staging_dim = if device.GetFeatureLevel().0 >= D3D_FEATURE_LEVEL_11_0.0 {
+                STAGING_DIM_FL11
+            } else {
+                STAGING_DIM_FL10
+            };
             log::info!("DXGI Output Duplication established (merged staging mode)");
 
             Ok(Self {
@@ -213,6 +265,7 @@ impl DxgiCapture {
                 staging: Vec::new(),
                 staging_w: 0,
                 staging_h: 0,
+                max_staging_dim,
                 acquired_seq: 0,
                 slots: Vec::new(),
                 last_present_tick: None,
@@ -220,6 +273,12 @@ impl DxgiCapture {
                 last_readback_ms: 0.0,
             })
         }
+    }
+
+    /// Consecutive DDA rebuild failures (0 = healthy). The main loop uses this to
+    /// surface a persistent exclusive-fullscreen/display-switch failure.
+    pub fn rebuild_failures(&self) -> u32 {
+        self.rebuild_failures
     }
 
     /// Capture the given source regions of one frame.
@@ -245,7 +304,12 @@ impl DxgiCapture {
                     .AcquireNextFrame(timeout_ms, &mut frame_info, &mut resource);
 
             match acquire_result {
-                Ok(()) => {}
+                Ok(()) => {
+                    // A working duplication session: clear the rebuild failure streak so
+                    // "consecutively" in the log is accurate and the main loop can stop
+                    // warning after recovery.
+                    self.rebuild_failures = 0;
+                }
                 Err(e) => {
                     let hresult = e.code().0;
                     if hresult == DXGI_ERROR_WAIT_TIMEOUT {
@@ -258,7 +322,10 @@ impl DxgiCapture {
                         // in a tight loop at frame rate would spam the log and hammer DWM.
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         match self.rebuild_duplication() {
-                            Ok(()) => return Ok(None),
+                            Ok(()) => {
+                                self.rebuild_failures = 0;
+                                return Ok(None);
+                            }
                             Err(re) => {
                                 // Swallow the error and keep retrying: while the game stays in
                                 // exclusive fullscreen the rebuild can legitimately fail for a
@@ -278,6 +345,12 @@ impl DxgiCapture {
                     return Err(AppError::windows("AcquireNextFrame", e));
                 }
             }
+
+            // From here on the frame is held. FrameLease releases it on every early
+            // return (null resource, cast/ensure_staging failure, Map failure, ...);
+            // otherwise the next AcquireNextFrame gets E_INVALIDARG and the main loop
+            // reaches its consecutive-error limit.
+            let lease = FrameLease::new(&self.duplication);
 
             let resource = resource.ok_or_else(|| AppError::other("acquired resource is null"))?;
             self.last_wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
@@ -299,17 +372,19 @@ impl DxgiCapture {
             // iteration ago gives the GPU a whole frame interval to finish it, instead
             // of stalling right after submission (a game saturating the GPU made the
             // stall ~30ms). Copy/readback alternate via acquired_seq parity.
+            let first_frame = self.acquired_seq == 0;
             let w_idx = (self.acquired_seq % 2) as usize;
             let r_idx = ((self.acquired_seq + 1) % 2) as usize;
 
-            // GPU-side crop: CopySubresourceRegion per region to different X offsets
+            // GPU-side crop: CopySubresourceRegion per region into its row-packed slot
             let tex = self.staging[w_idx].as_ref().unwrap();
             for (i, r) in regions.iter().enumerate() {
                 let x_off = self.slots[i].x_offset;
+                let y_off = self.slots[i].y_offset;
                 // Clamp to the desktop bounds: boxes outside the screen are illegal
                 // parameters (old code passed them through directly)
-                let right = (r.x + r.w).min(self.width);
-                let bottom = (r.y + r.h).min(self.height);
+                let right = r.x.saturating_add(r.w).min(self.width);
+                let bottom = r.y.saturating_add(r.h).min(self.height);
                 let left = r.x.min(right);
                 let top = r.y.min(bottom);
                 if left >= right || top >= bottom {
@@ -326,55 +401,61 @@ impl DxgiCapture {
                 };
                 self.context.CopySubresourceRegion(
                     tex, 0,
-                    x_off, 0, 0, // dst offset: horizontal layout
+                    x_off, y_off, 0,
                     &src_texture, 0,
                     Some(&src_box as *const D3D11_BOX),
                 );
             }
 
-            // First frame (or right after a staging rebuild): nothing was copied before,
-            // so there is nothing to read back yet; skip readback and return None, keeping
-            // the loop shape identical. acquired_seq is incremented before that check so
-            // the NEXT call reads the copy just submitted.
             self.acquired_seq += 1;
-            if self.acquired_seq <= 1 {
-                let _ = self.duplication.ReleaseFrame();
-                return Ok(None);
-            }
+            // First frame after startup or a staging rebuild has no older copy to read.
+            // Map the texture just written instead of dropping the frame: with the old
+            // early-return, a static desktop never produced a second frame, so
+            // AcquireNextFrame(0) timed out forever and the overlay stayed blank.
+            let read_idx = if first_frame { w_idx } else { r_idx };
 
             // Single Map readback for all regions (driver calls reduced from N*2 to 2)
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             if let Err(e) = self
                 .context
-                .Map(self.staging[r_idx].as_ref().unwrap(), 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .Map(self.staging[read_idx].as_ref().unwrap(), 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             {
-                // Release the current frame first, otherwise the next AcquireNextFrame
-                // is rejected with E_INVALIDARG, and 30 consecutive errors would trigger
-                // the main loop "safe exit"
-                let _ = self.duplication.ReleaseFrame();
                 return Err(AppError::windows("Map merged staging", e));
             }
 
             let src_ptr = mapped.pData as *const u8;
             let row_pitch = mapped.RowPitch as usize;
-            for i in 0..regions.len() {
+            for (i, r) in regions.iter().enumerate() {
+                let right = r.x.saturating_add(r.w).min(self.width);
+                let bottom = r.y.saturating_add(r.h).min(self.height);
+                let left = r.x.min(right);
+                let top = r.y.min(bottom);
+                let copy_w = right.saturating_sub(left) as usize;
+                let copy_h = bottom.saturating_sub(top) as usize;
+
                 let slot = &mut self.slots[i];
-                let row_bytes = slot.w as usize * 4;
-                let base_x_byte = slot.x_offset as usize * 4;
-                for row in 0..slot.h as usize {
+                let dst_stride = slot.w as usize * 4;
+                if copy_w != slot.w as usize || copy_h != slot.h as usize {
+                    // A region partly outside the screen is copied as a smaller box.
+                    // Clear the stale remainder instead of showing pixels from the
+                    // previous frame.
+                    slot.cpu.fill(0);
+                }
+                for row in 0..copy_h {
                     std::ptr::copy_nonoverlapping(
-                        src_ptr.add(row * row_pitch + base_x_byte),
-                        slot.cpu.as_mut_ptr().add(row * row_bytes),
-                        row_bytes,
+                        src_ptr.add(
+                            (slot.y_offset as usize + row) * row_pitch
+                                + slot.x_offset as usize * 4,
+                        ),
+                        slot.cpu.as_mut_ptr().add(row * dst_stride),
+                        copy_w * 4,
                     );
                 }
             }
-            self.context.Unmap(self.staging[r_idx].as_ref().unwrap(), 0);
+            self.context.Unmap(self.staging[read_idx].as_ref().unwrap(), 0);
             self.last_readback_ms = t_readback.elapsed().as_secs_f64() * 1000.0;
 
-            self.duplication
-                .ReleaseFrame()
-                .map_err(|e| AppError::windows("ReleaseFrame", e))?;
+            lease.release()?;
 
             let frames: Vec<RegionFrame<'_>> = self
                 .slots
@@ -386,27 +467,57 @@ impl DxgiCapture {
         }
     }
 
-    /// Ensure the merged staging textures are big enough for all regions (horizontal
-    /// layout). Two textures for pipelined readback; rebuilt together (one is not
-    /// useful without the other), which also resets the pipeline sequence.
+    /// Ensure the merged staging textures are big enough for all regions.
+    /// Regions are packed into rows: the old code used sum(width) as the texture
+    /// width, so e.g. five 3440px regions (17200px) exceeded the 16384px D3D11
+    /// limit and CreateTexture2D failed permanently. Two textures for pipelined
+    /// readback; rebuilt together (one is not useful without the other), which
+    /// also resets the pipeline sequence.
     fn ensure_staging(&mut self, regions: &[RegionRect]) -> AppResult<()> {
-        // Compute the packed layout
-        let mut total_w: u32 = 0;
-        let mut max_h: u32 = 0;
-        for r in regions {
-            total_w += r.w;
-            max_h = max_h.max(r.h);
-        }
-        if total_w == 0 || max_h == 0 {
+        if regions.is_empty() {
             return Ok(());
+        }
+
+        let max_dim = self.max_staging_dim.max(1);
+
+        // First pass: validate and compute the row-packed texture size.
+        let mut x: u32 = 0;
+        let mut y: u32 = 0;
+        let mut row_h: u32 = 0;
+        let mut texture_w: u32 = 0;
+        for r in regions {
+            if r.w == 0 || r.h == 0 {
+                return Err(AppError::other("capture region has zero width or height"));
+            }
+            if r.w > max_dim || r.h > max_dim {
+                return Err(AppError::other(format!(
+                    "capture region {}x{} exceeds the {}px staging texture limit",
+                    r.w, r.h, max_dim
+                )));
+            }
+            if x > 0 && x + r.w > max_dim {
+                y = y.saturating_add(row_h);
+                x = 0;
+                row_h = 0;
+            }
+            x += r.w;
+            row_h = row_h.max(r.h);
+            texture_w = texture_w.max(x);
+        }
+        let texture_h = y.saturating_add(row_h);
+        if texture_h > max_dim {
+            return Err(AppError::other(format!(
+                "capture regions need {}px of staging height, exceeding the {}px limit",
+                texture_h, max_dim
+            )));
         }
 
         unsafe {
             // Rebuild the staging textures (when the size is insufficient)
-            if self.staging_w < total_w || self.staging_h < max_h {
+            if self.staging_w < texture_w || self.staging_h < texture_h {
                 let desc = D3D11_TEXTURE2D_DESC {
-                    Width: total_w,
-                    Height: max_h,
+                    Width: texture_w.max(1),
+                    Height: texture_h.max(1),
                     MipLevels: 1,
                     ArraySize: 1,
                     Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -425,30 +536,73 @@ impl DxgiCapture {
                     .CreateTexture2D(&desc, None, Some(&mut tex1))
                     .map_err(|e| AppError::windows("CreateTexture2D merged staging (2)", e))?;
                 self.staging = vec![tex0, tex1];
-                self.staging_w = total_w;
-                self.staging_h = max_h;
+                self.staging_w = texture_w;
+                self.staging_h = texture_h;
                 // Pipeline restart: the next acquire re-seeds buffer 0, and the one after
                 // reads it; without this, the first Map after a resizing rebuild could
                 // read an empty texture.
                 self.acquired_seq = 0;
-                log::info!("merged staging rebuilt: {}x{} (ping-pong)", total_w, max_h);
+                log::info!(
+                    "merged staging rebuilt: {}x{} (ping-pong, row-packed)",
+                    texture_w, texture_h
+                );
             }
 
-            // Sync slots
+            // Second pass: sync slots with the same row layout.
+            let mut layout_changed = self.slots.len() != regions.len();
             self.slots.truncate(regions.len());
             while self.slots.len() < regions.len() {
-                self.slots.push(RegionSlot { cpu: Vec::new(), w: 0, h: 0, x_offset: 0 });
+                self.slots.push(RegionSlot {
+                    cpu: Vec::new(),
+                    w: 0,
+                    h: 0,
+                    x_offset: 0,
+                    y_offset: 0,
+                });
             }
-            let mut x_off: u32 = 0;
+
+            let mut x: u32 = 0;
+            let mut y: u32 = 0;
+            let mut row_h: u32 = 0;
             for (i, r) in regions.iter().enumerate() {
+                if x > 0 && x + r.w > max_dim {
+                    y += row_h;
+                    x = 0;
+                    row_h = 0;
+                }
                 let slot = &mut self.slots[i];
-                slot.x_offset = x_off;
+                if slot.w != r.w
+                    || slot.h != r.h
+                    || slot.x_offset != x
+                    || slot.y_offset != y
+                {
+                    layout_changed = true;
+                }
+                slot.x_offset = x;
+                slot.y_offset = y;
                 if slot.w != r.w || slot.h != r.h {
+                    let bytes = (r.w as usize)
+                        .checked_mul(r.h as usize)
+                        .and_then(|n| n.checked_mul(4))
+                        .ok_or_else(|| {
+                            AppError::other(format!(
+                                "capture region {}x{} is too large to allocate",
+                                r.w, r.h
+                            ))
+                        })?;
                     slot.w = r.w;
                     slot.h = r.h;
-                    slot.cpu = vec![0u8; (r.w * r.h * 4) as usize];
+                    slot.cpu = vec![0u8; bytes];
                 }
-                x_off += r.w;
+                x += r.w;
+                row_h = row_h.max(r.h);
+            }
+
+            if layout_changed && self.acquired_seq != 0 {
+                // The layout changed but the texture size did not. Restart the
+                // pipeline so the next acquire reads the frame it just copied,
+                // instead of a ping-pong texture with the previous layout.
+                self.acquired_seq = 0;
             }
         }
         Ok(())
@@ -510,6 +664,11 @@ impl DxgiCapture {
             self.context = context;
             self.device = device;
             self.output1 = output1;
+            self.max_staging_dim = if self.device.GetFeatureLevel().0 >= D3D_FEATURE_LEVEL_11_0.0 {
+                STAGING_DIM_FL11
+            } else {
+                STAGING_DIM_FL10
+            };
 
             // Clear the staging cache (pipeline restarts on the next acquire)
             self.staging = Vec::new();

@@ -34,15 +34,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
     GetSystemMetrics, KillTimer, LoadCursorW, PeekMessageW, RegisterClassExW, SetCursor,
-    SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage, UpdateLayeredWindow,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
     WaitMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSEXW, WM_CHAR, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, CS_HREDRAW, CS_VREDRAW,
     IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, MSG, PM_REMOVE, SM_CXSCREEN,
-    SM_CYSCREEN, SW_SHOW, ULW_ALPHA, WS_EX_LAYERED, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SM_CYSCREEN, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, ULW_ALPHA, WS_EX_LAYERED,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
-use crate::config::{CaptureRegion, Config, DisplayRect, WindowConfig};
+use crate::config::{CaptureRegion, Config, DisplayRect};
 use crate::config::GlobalSettings;
 use crate::error::{AppError, AppResult};
 
@@ -64,7 +65,7 @@ use events::{on_char, on_keydown, on_lbutton_down, on_lbutton_up, on_mouse_move,
 pub fn run_editor(
     current_config: &Config,
     initial_filename: &str,
-) -> AppResult<Option<(Config, String)>> {
+) -> AppResult<Option<String>> {
     unsafe {
         let sw = GetSystemMetrics(SM_CXSCREEN);
         let sh = GetSystemMetrics(SM_CYSCREEN);
@@ -220,6 +221,10 @@ pub fn run_editor(
         render();
 
         let mut msg = MSG::default();
+        // Some(...) only after the file has actually been written. On a write error the
+        // editor stays open so the user's work is not lost and can retry; the old flow
+        // returned the config, main ignored save_as's error and reloaded the old file.
+        let mut saved_filename: Option<String> = None;
         loop {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).into() {
                 let _ = TranslateMessage(&msg);
@@ -234,7 +239,48 @@ pub fn run_editor(
                 }
             }
             if with_state(|s| s.close_requested) {
-                break;
+                // A save with zero elements is meaningful (clear the config), but make
+                // the user confirm it instead of silently treating Save as Cancel.
+                let (empty_save, hwnd_raw) =
+                    with_state(|st| (st.saved && st.elements.is_empty(), st.hwnd));
+                if empty_save
+                    && !crate::dialog::confirm(
+                        HWND(hwnd_raw as *mut std::ffi::c_void),
+                        crate::i18n::t("empty_config_title"),
+                        crate::i18n::t("empty_config_ask"),
+                    )
+                {
+                    with_state(|st| st.close_requested = false);
+                    render();
+                    continue;
+                }
+                let Some((new_cfg, filename)) = build_editor_result(current_config) else {
+                    // Cancelled / discarded: close without writing
+                    break;
+                };
+                match new_cfg.save_as(&filename) {
+                    Ok(()) => {
+                        log::info!(
+                            "Editor: saved config {} ({} elements)",
+                            filename,
+                            new_cfg.capture_regions.len() + new_cfg.custom_ui.len()
+                        );
+                        saved_filename = Some(filename);
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("Editor: failed to save config {}: {}", filename, e);
+                        let hwnd_raw = with_state(|s| s.hwnd);
+                        crate::dialog::error(
+                            HWND(hwnd_raw as *mut std::ffi::c_void),
+                            crate::i18n::t("save_failed"),
+                            &format!("{}\n\n{}", filename, e),
+                        );
+                        // Stay in the editor: let the user fix the file name or retry
+                        with_state(|st| st.close_requested = false);
+                        render();
+                    }
+                }
             }
             // Suspend when idle (WM_TIMER/mouse/keyboard messages wake it up), avoiding busy polling
             let _ = WaitMessage();
@@ -243,66 +289,62 @@ pub fn run_editor(
         let hwnd_raw = with_state(|s| s.hwnd);
         let _ = DestroyWindow(HWND(hwnd_raw as *mut std::ffi::c_void));
 
-        let result = with_state_ref(|st| {
-            if st.saved && !st.elements.is_empty() {
-                let mut new_cfg = current_config.clone();
-                // Record the current overlay anchor; size is still auto-determined by content
-                new_cfg.settings.window = Some(WindowConfig {
-                    x: st.overlay_x,
-                    y: st.overlay_y,
-                    width: st.overlay_w,
-                    height: st.overlay_h,
-                });
-                new_cfg.capture_regions.clear();
-                new_cfg.custom_ui.clear();
-                let mut capture_count = 0usize;
-                for e in &st.elements {
-                    let extra = &e.extra;
-                    let dr = &e.display;
-                    match extra.kind {
-                        ElemKind::Capture => {
-                            capture_count += 1;
-                            let mut display = dr.clone();
-                            // User never explicitly set opacity → don't write the entry (inherits global_opacity)
-                            display.opacity = if extra.opacity_explicit { Some(extra.opacity) } else { None };
-                            // Render order lives on display.z; the legacy top-level z is no longer written (still read on load)
-                            display.z_order = extra.z_order;
-                            let src = e.source_rect();
-                            // 1:1 display (editor size equals the source) → write 0 so the entry stays
-                            // compact and follows the source size at runtime
-                            if dr.width == src.width as i32 && dr.height == src.height as i32 {
-                                display.width = 0;
-                                display.height = 0;
-                            }
-                            new_cfg.capture_regions.push(CaptureRegion {
-                                id: format!("region_{}", capture_count),
-                                source: src,
-                                display,
-                                z_order: None,
-                            });
+        Ok(saved_filename)
+    }
+}
+
+/// Build the config that the editor currently represents, plus its resolved file name.
+/// Returns None when the user cancelled/discarded the edit.
+fn build_editor_result(current_config: &Config) -> Option<(Config, String)> {
+    with_state_ref(|st| {
+        if st.saved {
+            let mut new_cfg = current_config.clone();
+            new_cfg.capture_regions.clear();
+            new_cfg.custom_ui.clear();
+            let mut capture_count = 0usize;
+            for e in &st.elements {
+                let extra = &e.extra;
+                let dr = &e.display;
+                match extra.kind {
+                    ElemKind::Capture => {
+                        capture_count += 1;
+                        let mut display = dr.clone();
+                        // User never explicitly set opacity → don't write the entry (inherits global_opacity)
+                        display.opacity = if extra.opacity_explicit { Some(extra.opacity) } else { None };
+                        // Render order lives on display.z; the legacy top-level z is no longer written (still read on load)
+                        display.z_order = extra.z_order;
+                        let src = e.source_rect();
+                        // 1:1 display (editor size equals the source) → write 0 so the entry stays
+                        // compact and follows the source size at runtime
+                        if dr.width == src.width as i32 && dr.height == src.height as i32 {
+                            display.width = 0;
+                            display.height = 0;
                         }
-                        _ => {
-                            new_cfg.custom_ui.push(extra_to_ui_elem(extra, dr));
-                        }
+                        new_cfg.capture_regions.push(CaptureRegion {
+                            id: format!("region_{}", capture_count),
+                            source: src,
+                            display,
+                            z_order: None,
+                        });
+                    }
+                    _ => {
+                        new_cfg.custom_ui.push(extra_to_ui_elem(extra, dr));
                     }
                 }
-                let filename = resolve_filename(&st.save_filename);
-                log::info!("Editor: saved config {} ({} elements)", filename, st.elements.len());
-                Some((new_cfg, filename))
-            } else {
-                None
             }
-        });
-        Ok(result)
-    }
+            let filename = resolve_filename(&st.save_filename);
+            Some((new_cfg, filename))
+        } else {
+            None
+        }
+    })
 }
 
 /// config's CustomUiElement → editor ElemExtra
 fn ui_elem_to_extra(ui: &crate::config::CustomUiElement, cfg: &Config) -> ElemExtra {
     use crate::config::CustomUiElement as U;
-    let _ = cfg;
     let read_opacity = |raw: Option<f32>, extra: &mut ElemExtra| {
-        extra.opacity = raw.unwrap_or(cfg.effective_global_opacity());
+        extra.opacity = cfg.effective_opacity(raw);
         extra.opacity_explicit = raw.is_some();
     };
     match ui {
@@ -585,6 +627,58 @@ fn render() {
 
 // ===== Window proc =====
 
+/// The desktop resolution changed while the editor is open. Resize the full-screen
+/// window to the new screen, abort mouse interactions that hold old coordinates,
+/// keep the panel visible and redraw. Element coordinates are intentionally left
+/// untouched: they are user-chosen absolute screen positions, not a layout to remap.
+unsafe fn on_display_change(hwnd: HWND) {
+    let sw = GetSystemMetrics(SM_CXSCREEN);
+    let sh = GetSystemMetrics(SM_CYSCREEN);
+    let changed = with_state(|st| {
+        if sw <= 0 || sh <= 0 || (st.screen_w == sw && st.screen_h == sh) {
+            return false;
+        }
+        let old_w = st.screen_w;
+        st.screen_w = sw;
+        st.screen_h = sh;
+        events::cancel_interactions(st);
+        // The panel starts docked to the right edge. Keep it docked when it was
+        // there; otherwise clamp it into the new screen so it cannot be lost.
+        let docked = st.panel_x + PANEL_W + 20 >= old_w;
+        let max_x = (sw - PANEL_W - 12).max(4);
+        st.panel_x = if docked {
+            max_x
+        } else {
+            st.panel_x.clamp(4, max_x)
+        };
+        st.panel_y = st.panel_y.clamp(4, (sh - TITLE_H - 60).max(4));
+        st.mouse_x = st.mouse_x.clamp(0, sw.saturating_sub(1));
+        st.mouse_y = st.mouse_y.clamp(0, sh.saturating_sub(1));
+        st.over_title = false;
+        st.tooltip_show = false;
+        st.snapped_x = None;
+        st.snapped_y = None;
+        true
+    });
+    if !changed {
+        return;
+    }
+    // Abort any mouse capture owned by an in-progress drag: its coordinates
+    // belong to the old resolution and the follow-up mouse-up would be misleading.
+    let _ = ReleaseCapture();
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        sw,
+        sh,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+    render();
+    log::info!("Editor window resized for display change: {}x{}", sw, sh);
+}
+
 unsafe extern "system" fn editor_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -592,6 +686,10 @@ unsafe extern "system" fn editor_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_DISPLAYCHANGE => {
+            on_display_change(hwnd);
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);

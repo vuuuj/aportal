@@ -38,7 +38,7 @@ fn apply_add_kind(st: &mut super::state::EditorState, k: AddKind) {
 /// Abort any in-progress mouse interaction (drag/box-select/resize).
 /// Phase switching must call this: leftover state from the old phase would act on the new
 /// one (e.g. a Selecting drag box kept alive after Enter leaves a ghost box when switching back).
-fn cancel_interactions(st: &mut super::state::EditorState) {
+pub(super) fn cancel_interactions(st: &mut super::state::EditorState) {
     st.is_dragging = false;
     st.drag_start = None;
     st.drag_current = None;
@@ -801,6 +801,15 @@ pub fn on_keydown(vk: u32) -> bool {
 
 // ===== Character input =====
 
+/// Characters allowed in the save-file name box. Path separators and the other
+/// Windows-reserved file-name characters are rejected at the source so a name can
+/// never point outside the exe directory or at a device.
+fn is_allowed_filename_char(ch: char) -> bool {
+    !ch.is_control()
+        && !matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        && (ch.is_ascii_graphic() || ch == ' ' || !ch.is_ascii())
+}
+
 pub fn on_char(ch: char) -> bool {
     with_state(|st| {
         // Editing an element property field
@@ -844,7 +853,7 @@ pub fn on_char(ch: char) -> bool {
             return false;
         }
 
-        if st.filename_focused && !st.confirm_overwrite && (ch.is_ascii_graphic() || !ch.is_ascii()) {
+        if st.filename_focused && !st.confirm_overwrite && is_allowed_filename_char(ch) {
             st.save_filename.push(ch);
             true
         } else {

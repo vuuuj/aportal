@@ -1,9 +1,6 @@
 //! Visual helpers: magnifier, grid, crosshair, XY values
 
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC,
-};
+use windows::Win32::Graphics::Gdi::{StretchBlt, HDC, SRCCOPY};
 
 use super::common::*;
 use super::state::EditorState;
@@ -22,34 +19,17 @@ pub unsafe fn draw_magnifier(hdc: HDC, hdc_screen: HDC, st: &EditorState) {
     let cap_x = (st.mouse_x - MAG_CAPTURE / 2).clamp(0, st.screen_w.saturating_sub(MAG_CAPTURE));
     let cap_y = (st.mouse_y - MAG_CAPTURE / 2).clamp(0, st.screen_h.saturating_sub(MAG_CAPTURE));
 
-    let temp_dc = CreateCompatibleDC(hdc_screen);
-    let bi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: MAG_CAPTURE, biHeight: -MAG_CAPTURE, biPlanes: 1, biBitCount: 32,
-            biCompression: BI_RGB.0, ..Default::default()
-        }, ..Default::default()
-    };
-    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-    let cap_bmp = match CreateDIBSection(temp_dc, &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
-        Ok(b) => b,
-        Err(_) => { let _ = DeleteDC(temp_dc); return; }
-    };
-    let old_cap = SelectObject(temp_dc, cap_bmp);
-
-    #[link(name = "gdi32")]
-    extern "system" {
-        fn BitBlt(hdc: isize, x: i32, y: i32, cx: i32, cy: i32, hdcsrc: isize, x1: i32, y1: i32, rop: u32) -> i32;
-        fn StretchBlt(hdcdst: isize, xdst: i32, ydst: i32, wdst: i32, hdst: i32, hdcsrc: isize, xsrc: i32, ysrc: i32, wsrc: i32, hsrc: i32, rop: u32) -> i32;
-    }
-    const SRCCOPY: u32 = 0x00CC0020;
-
-    let _ = BitBlt(temp_dc.0 as isize, 0, 0, MAG_CAPTURE, MAG_CAPTURE, hdc_screen.0 as isize, cap_x, cap_y, SRCCOPY);
-    let _ = StretchBlt(hdc.0 as isize, mag_x, mag_y, MAG_SIZE, MAG_SIZE, temp_dc.0 as isize, 0, 0, MAG_CAPTURE, MAG_CAPTURE, SRCCOPY);
-
-    SelectObject(temp_dc, old_cap);
-    let _ = DeleteObject(cap_bmp);
-    let _ = DeleteDC(temp_dc);
+    // Stretch the screen pixels directly into the editor surface. The old path
+    // copied 200x200 into a temporary DC/DIB first, which allocated GDI objects
+    // on every mouse-move frame. Screen content is deliberately not cached: a
+    // cached copy would go stale as soon as the desktop changes.
+    let _ = StretchBlt(
+        hdc,
+        mag_x, mag_y, MAG_SIZE, MAG_SIZE,
+        hdc_screen,
+        cap_x, cap_y, MAG_CAPTURE, MAG_CAPTURE,
+        SRCCOPY,
+    );
 
     // Border
     draw_rect_outline(hdc, mag_x, mag_y, MAG_SIZE, MAG_SIZE, 2, rgb(255, 220, 60));

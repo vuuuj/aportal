@@ -22,7 +22,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::error::{AppError, AppResult};
 
 /// Transparent overlay window
-#[allow(dead_code)]
 pub struct OverlayWindow {
     pub hwnd: HWND,
     pub width: i32,

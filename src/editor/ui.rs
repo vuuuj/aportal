@@ -18,25 +18,30 @@ pub struct Btn {
     pub action: BtnAction,
 }
 
-/// Mode-switch buttons (own row): enter arrange / enter select mode
+/// Mode-switch buttons (own row): 选取/排布 are both always visible; the active mode is
+/// highlighted, the other stays clickable (never greyed out). Clicking the active one is a no-op.
 pub fn mode_buttons(phase: EditorPhase) -> Vec<Btn> {
     let mut v: Vec<Btn> = Vec::new();
     let mut x = 0;
     let gap = 8;
+    let selecting = phase == EditorPhase::Selecting;
+    let arranging = phase == EditorPhase::Arranging;
     macro_rules! push {
         ($w:expr, $label:expr, $bg:expr, $fg:expr, $bd:expr, $act:expr) => {{
             v.push(Btn { x, w: $w, label: $label, bg: $bg, fg: $fg, border: $bd, action: $act });
             x += $w + gap;
         }};
     }
-    match phase {
-        EditorPhase::Selecting => {
-            push!(164, crate::i18n::t("next_step"), rgb(56, 132, 96), rgb(255, 255, 255), rgb(120, 200, 150), BtnAction::NextStep);
-        }
-        EditorPhase::Arranging => {
-            push!(164, crate::i18n::t("back"), rgb(74, 108, 150), rgb(255, 255, 255), rgb(130, 170, 210), BtnAction::BackToSelect);
-        }
-    }
+    push!(96, crate::i18n::t("select_mode"),
+        if selecting { rgb(56, 132, 96) } else { rgb(60, 66, 92) },
+        rgb(255, 255, 255),
+        if selecting { rgb(120, 200, 150) } else { rgb(90, 96, 130) },
+        BtnAction::BackToSelect);
+    push!(96, crate::i18n::t("arrange_mode"),
+        if arranging { rgb(74, 108, 150) } else { rgb(60, 66, 92) },
+        rgb(255, 255, 255),
+        if arranging { rgb(130, 170, 210) } else { rgb(90, 96, 130) },
+        BtnAction::NextStep);
     let _ = x;
     v
 }
@@ -286,11 +291,25 @@ pub fn confirm_box(sw: i32, sh: i32) -> (i32, i32, i32, i32) {
 }
 
 pub fn resolve_filename(s: &str) -> String {
+    let s = s.trim();
     if s.is_empty() {
-        crate::config::UNNAMED_CONFIG.to_string()
+        return crate::i18n::t("unnamed_file").to_string();
+    }
+    // YAML support dropped: strip a trailing .yaml/.yml (case-insensitive) from the
+    // input, always append .yml. Trailing dots/spaces are removed because Windows
+    // would silently strip them and could then collide with another file name.
+    let lower = s.to_ascii_lowercase();
+    let stem = if lower.ends_with(".yaml") {
+        &s[..s.len() - 5]
+    } else if lower.ends_with(".yml") {
+        &s[..s.len() - 4]
     } else {
-        // YAML support dropped: strip a trailing .yaml/.yml from the input, always append .yml
-        let stem = s.trim_end_matches(".yaml").trim_end_matches(".yml");
+        s
+    };
+    let stem = stem.trim_end_matches(['.', ' ']);
+    if stem.is_empty() {
+        crate::i18n::t("unnamed_file").to_string()
+    } else {
         format!("{stem}.yml")
     }
 }
@@ -315,4 +334,20 @@ pub unsafe fn draw_confirm_modal(hdc: HDC, st: &EditorState) {
 
     draw_button(hdc, cx + 60, cy + 100, 150, 40, crate::i18n::t("yes_overwrite"), rgb(150, 64, 64), rgb(255, 255, 255), rgb(210, 110, 110));
     draw_button(hdc, cx + 250, cy + 100, 150, 40, crate::i18n::t("no"), rgb(60, 66, 92), rgb(220, 225, 240), rgb(90, 96, 130));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_filename;
+
+    #[test]
+    fn resolve_filename_normalizes_input() {
+        assert_eq!(resolve_filename(""), crate::i18n::t("unnamed_file"));
+        assert_eq!(resolve_filename("   "), crate::i18n::t("unnamed_file"));
+        assert_eq!(resolve_filename("abc"), "abc.yml");
+        assert_eq!(resolve_filename("abc.yml"), "abc.yml");
+        assert_eq!(resolve_filename("abc.YAML"), "abc.yml");
+        assert_eq!(resolve_filename(" v1.2.yml "), "v1.2.yml");
+        assert_eq!(resolve_filename("name."), "name.yml");
+    }
 }
