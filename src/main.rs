@@ -1199,7 +1199,8 @@ fn reload_or_activate(actives: &mut Vec<ActiveConfig>, filename: &str) {
 
 /// Multi-region layout + premultiplied alpha.
 /// Data is already cropped by the GPU (RegionFrame); here we only lay out, scale, and apply alpha.
-/// Optimizations: direct DIB write / 1:1 fast path / bilinear interpolation / skip when alpha=255 / stack-array sort
+/// Optimizations: direct DIB write / 1:1 fast path / bilinear interpolation / skip when alpha=255 /
+/// stack-array sort for common small layouts, heap fallback for larger configs
 fn render_regions(
     region_frames: &[RegionFrame<'_>],
     cfg: &Config,
@@ -1212,15 +1213,24 @@ fn render_regions(
     let dst_h_i32 = dst_h;
     let dst_total = (dst_w * dst_h * 4) as usize;
 
-    // Sort by z_order (stack array to avoid a per-frame Vec heap allocation)
-    let n = cfg.capture_regions.len().min(32).min(region_frames.len());
-    let mut indices = [0usize; 32];
-    for (i, slot) in indices[..n].iter_mut().enumerate() {
-        *slot = i;
-    }
-    indices[..n].sort_by_key(|&i| cfg.capture_regions[i].display.z_order);
+    // Sort by z_order. A stack array avoids a per-frame heap allocation for the
+    // common small layout; larger configs fall back to a Vec instead of silently
+    // dropping regions past the 32nd.
+    let n = cfg.capture_regions.len().min(region_frames.len());
+    let mut stack_indices = [0usize; 32];
+    let mut heap_indices = Vec::new();
+    let indices: &mut [usize] = if n <= stack_indices.len() {
+        for (i, slot) in stack_indices[..n].iter_mut().enumerate() {
+            *slot = i;
+        }
+        &mut stack_indices[..n]
+    } else {
+        heap_indices.extend(0..n);
+        &mut heap_indices
+    };
+    indices.sort_by_key(|&i| cfg.capture_regions[i].display.z_order);
 
-    for &i in &indices[..n] {
+    for &i in indices.iter() {
         let region = &cfg.capture_regions[i];
         let rf = &region_frames[i];
         let src_w = rf.w;
@@ -1568,4 +1578,55 @@ mod tests {
     fn axis_rotate_270() { check_axis(270); }
     #[test]
     fn axis_rotate_90_plus_360() { check_axis(450); }
+
+    /// Regression: the old renderer capped layouts at 32 regions. Every region
+    /// must still be painted, and z_order must work across that boundary.
+    #[test]
+    fn render_regions_supports_more_than_32_regions() {
+        const COUNT: usize = 40;
+        // One 1x1 frame per region; the red channel identifies the region.
+        let frames: Vec<Vec<u8>> = (0..COUNT)
+            .map(|i| vec![(i + 1) as u8, 0, 0, 255])
+            .collect();
+        let region_frames: Vec<RegionFrame<'_>> = frames
+            .iter()
+            .map(|data| RegionFrame { data, w: 1, h: 1 })
+            .collect();
+        let mut cfg = Config {
+            capture_regions: (0..COUNT)
+                .map(|i| CaptureRegion {
+                    id: format!("r{i}"),
+                    source: Rect { x: 0, y: 0, width: 1, height: 1 },
+                    display: DisplayRect {
+                        x: i as i32,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                        opacity: None,
+                        z_order: i as i32,
+                        rotate: 0,
+                    },
+                    z_order: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        // Side by side: every column must be painted (no truncation).
+        let mut dst = vec![0u8; COUNT * 4];
+        render_regions(&region_frames, &cfg, dst.as_mut_ptr(), COUNT as i32, 1, 1.0);
+        for (i, px) in dst.chunks_exact(4).enumerate() {
+            assert_eq!(px[0], (i + 1) as u8, "region {i} was not rendered");
+            assert_eq!((px[1], px[2], px[3]), (0, 0, 255));
+        }
+
+        // Stacked at one pixel: the highest z_order (region 39) must win,
+        // proving the sort covers indices beyond the old 32-entry array.
+        for region in &mut cfg.capture_regions {
+            region.display.x = 0;
+        }
+        let mut dst = vec![0u8; 4];
+        render_regions(&region_frames, &cfg, dst.as_mut_ptr(), 1, 1, 1.0);
+        assert_eq!(&dst[..], &[COUNT as u8, 0, 0, 255]);
+    }
 }

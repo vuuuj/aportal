@@ -5,14 +5,17 @@
 #[path = "src/app_icon.rs"]
 mod app_icon;
 
+use std::path::{Path, PathBuf};
+
 fn main() {
-    // 注意: rc.exe 无法处理含中文的路径; OUT_DIR 通常位于中文工作区下,
-    // 因此不用 OUT_DIR, 固定在系统临时目录 (用户目录需为 ASCII, 本项目如此)。
-    let out_dir = std::env::temp_dir().join("aportal_icon");
-    std::fs::create_dir_all(&out_dir).expect("创建临时图标目录失败");
+    // rc.exe 对非 ASCII 输入路径支持不可靠, 而 OUT_DIR 通常位于中文工作区下,
+    // 因此仅当 OUT_DIR 全为 ASCII 时才用它; 否则退回系统临时目录。
+    // 每次构建使用独立子目录, 避免并发/连续构建互相覆盖 ico 和 rc。
+    let work_dir = BuildTempDir::new();
+    std::fs::create_dir_all(work_dir.path()).expect("创建临时图标目录失败");
 
     // 1. 渲染多尺寸图标并打包成 .ico
-    let ico_path = out_dir.join("aportal.ico");
+    let ico_path = work_dir.path().join("aportal.ico");
     let ico_data = pack_ico(&[16, 24, 32, 48, 64]);
     std::fs::write(&ico_path, &ico_data).expect("写 aportal.ico 失败");
 
@@ -65,14 +68,53 @@ fn main() {
     for unit in rc.encode_utf16() {
         rc_bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    let rc_path = out_dir.join("aportal.rc");
+    let rc_path = work_dir.path().join("aportal.rc");
     std::fs::write(&rc_path, rc_bytes).expect("写 aportal.rc 失败");
 
-    // 3. 编译并嵌入 exe
+    // 3. 编译并嵌入 exe。embed_resource 会把可链接的 .lib 写进 OUT_DIR,
+    //    临时目录里的 ico/rc 只是编译输入, 完成后即可删除。
     embed_resource::compile(rc_path.to_str().unwrap(), embed_resource::NONE);
+    drop(work_dir);
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/app_icon.rs");
+}
+
+/// 每次构建独立的临时工作目录; Drop 时递归删除。
+struct BuildTempDir {
+    path: PathBuf,
+}
+
+impl BuildTempDir {
+    fn new() -> Self {
+        // PID + 纳秒时间戳: 同一进程内多次运行也不会复用目录。
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let name = format!("aportal-icon-{unique}");
+
+        if let Some(out_dir) = std::env::var_os("OUT_DIR").map(PathBuf::from) {
+            if out_dir.as_os_str().is_ascii() {
+                return Self { path: out_dir.join(name) };
+            }
+        }
+        Self { path: std::env::temp_dir().join(name) }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for BuildTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// 把多个尺寸的 BGRA 渲染结果打包成 .ico 文件
